@@ -92,6 +92,8 @@ const Captcha = ({
   const onTokenChangeRef = useRef(onTokenChange);
   const onErrorRef = useRef(onError);
   const [status, setStatus] = useState<ScriptStatus>("idle");
+  const loadingLabel = labels?.loading ?? "加载验证码组件…";
+  const errorLabel = labels?.error ?? "验证码加载失败，请刷新后重试";
 
   useEffect(() => {
     onTokenChangeRef.current = onTokenChange;
@@ -125,7 +127,7 @@ const Captcha = ({
         const handleError = () => {
           if (disposed) return;
           setStatus("error");
-          onErrorRef.current?.(labels?.error ?? "验证码加载失败，请刷新后重试");
+          onErrorRef.current?.(errorLabel);
         };
         const handleExpired = () => {
           if (disposed) return;
@@ -169,7 +171,7 @@ const Captcha = ({
       } catch (error) {
         if (!disposed) {
           setStatus("error");
-          onErrorRef.current?.(labels?.error ?? "验证码加载失败，请刷新后重试");
+          onErrorRef.current?.(errorLabel);
           console.warn("captcha init failed", error);
         }
       }
@@ -185,7 +187,7 @@ const Captcha = ({
         window.grecaptcha.reset(widgetIdRef.current as number);
       }
     };
-  }, [provider, normalizedKey, resetSignal]);
+  }, [provider, normalizedKey, resetSignal, errorLabel]);
 
   if (!normalizedKey) {
     return null;
@@ -196,12 +198,12 @@ const Captcha = ({
       <div ref={containerRef} />
       {status === "loading" ? (
         <span className="captcha__status">
-          {labels?.loading ?? "加载验证码组件…"}
+          {loadingLabel}
         </span>
       ) : null}
       {status === "error" ? (
         <span className="captcha__status captcha__status--error">
-          {labels?.error ?? "验证码加载失败"}
+          {errorLabel}
         </span>
       ) : null}
     </div>

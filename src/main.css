@@ -1,35 +1,130 @@
 :root {
-  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+  color-scheme: light;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui,
     sans-serif;
   line-height: 1.5;
-  color: #0f172a;
-  background-color: #f8fafc;
+  font-weight: 400;
+  color: #1d1d1f;
+  background: #f5f5f7;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --system-background: #f5f5f7;
+  --grouped-background: #ffffff;
+  --secondary-grouped-background: #f2f2f7;
+  --tertiary-grouped-background: #e9e9ef;
+  --label: #1d1d1f;
+  --secondary-label: #6e6e73;
+  --tertiary-label: #8a8a8e;
+  --separator: rgba(60, 60, 67, 0.18);
+  --separator-strong: rgba(60, 60, 67, 0.28);
+  --blue-accent: #0071e3;
+  --blue-accent-hover: #0077ed;
+  --blue-accent-soft: rgba(0, 113, 227, 0.1);
+  --green: #0a7f45;
+  --green-soft: rgba(52, 199, 89, 0.14);
+  --yellow: #b45309;
+  --yellow-soft: rgba(255, 204, 0, 0.2);
+  --danger: #b91c1c;
+  --danger-bg: #fff2f2;
+  --danger-border: rgba(185, 28, 28, 0.34);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.06);
+  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --radius-xl: 24px;
+  --radius-lg: 18px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+  --wide: 82rem;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  color: #f5f5f7;
+  background: #000000;
+
+  --system-background: #000000;
+  --grouped-background: #1c1c1e;
+  --secondary-grouped-background: #2c2c2e;
+  --tertiary-grouped-background: #3a3a3c;
+  --label: #f5f5f7;
+  --secondary-label: #a1a1a6;
+  --tertiary-label: #7d7d82;
+  --separator: rgba(84, 84, 88, 0.55);
+  --separator-strong: rgba(99, 99, 102, 0.76);
+  --blue-accent: #0a84ff;
+  --blue-accent-hover: #409cff;
+  --blue-accent-soft: rgba(10, 132, 255, 0.18);
+  --green: #30d158;
+  --green-soft: rgba(48, 209, 88, 0.18);
+  --yellow: #ffd60a;
+  --yellow-soft: rgba(255, 214, 10, 0.16);
+  --danger: #ff8a8a;
+  --danger-bg: #2c1618;
+  --danger-border: rgba(248, 113, 113, 0.46);
+  --shadow: none;
+  --shadow-subtle: none;
 }
 
 * {
   box-sizing: border-box;
 }
 
+html {
+  min-height: 100%;
+  background: var(--system-background);
+}
+
 body {
   margin: 0;
+  min-width: 320px;
   min-height: 100vh;
-  background: radial-gradient(circle at top, #ecfdf3 0%, #f8fafc 60%);
+  background:
+    radial-gradient(circle at 10% -10%, var(--blue-accent-soft), transparent 34rem),
+    radial-gradient(circle at 92% 8%, rgba(52, 199, 89, 0.1), transparent 28rem),
+    var(--system-background);
+  color: var(--label);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button,
+select {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  cursor: not-allowed;
 }
 
 h1,
 h2,
 h3,
+h4,
 p {
   margin: 0;
 }
 
-button {
-  font: inherit;
-  cursor: pointer;
+button,
+input,
+textarea,
+select {
+  color: inherit;
 }
 
-.container {
-  width: min(1100px, 90vw);
-  margin: 0 auto;
-  padding: 48px 0 64px;
+:where(a, button, input, textarea, select):focus-visible {
+  outline: 3px solid var(--blue-accent-soft);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: var(--blue-accent-soft);
 }

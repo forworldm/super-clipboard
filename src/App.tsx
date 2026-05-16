@@ -43,6 +43,7 @@ type ToastState = {
 };
 
 const SETTINGS_STORAGE_KEY = "super-clipboard::settings";
+const THEME_STORAGE_KEY = "super-clipboard::theme";
 const MIN_EXPIRY_HOURS = 1;
 const MAX_EXPIRY_HOURS = 120;
 const DEFAULT_EXPIRY_HOURS = 24;
@@ -57,6 +58,27 @@ type DraftFile = {
   size: number;
   type: string;
   dataUrl: string;
+};
+
+type ThemeMode = "light" | "dark";
+
+const getInitialThemeMode = (): ThemeMode => {
+  if (typeof window === "undefined") {
+    return "light";
+  }
+
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+
+    return window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : "light";
+  } catch {
+    return "light";
+  }
 };
 
 const emptyToast: ToastState | null = null;
@@ -103,6 +125,9 @@ const App = () => {
   const [captchaError, setCaptchaError] = useState<string | null>(null);
   const [captchaResetKey, setCaptchaResetKey] = useState(0);
   const [captchaConfig, setCaptchaConfig] = useState<AppConfig | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+
+  const isDarkTheme = themeMode === "dark";
 
   const captchaProvider = useMemo<CaptchaProviderType | null>(() => {
     if (!captchaConfig?.captchaProvider) {
@@ -117,6 +142,19 @@ const App = () => {
     [captchaConfig?.captchaSiteKey]
   );
   const isCaptchaEnabled = Boolean(captchaProvider && captchaSiteKey);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch (error) {
+      console.warn("Failed to persist theme preference:", error);
+    }
+  }, [themeMode]);
+
+  const handleToggleTheme = () => {
+    setThemeMode((current) => (current === "dark" ? "light" : "dark"));
+  };
 
   useEffect(() => {
     try {
@@ -235,6 +273,7 @@ const App = () => {
     settings.persistentToken,
     settings.tokenLastUsedAt,
     settings.tokenUpdatedAt,
+    t,
     updateSettings
   ]);
 
@@ -770,11 +809,15 @@ const App = () => {
   };
 
   return (
-    <div>
-      <header className="hero">
-        <div className="hero__top">
-          <div className="hero__badge">Super Clipboard</div>
-          <div className="hero__controls">
+    <div className="app-shell">
+      <header className="site-header">
+        <div className="site-header-inner">
+          <div className="site-brand" aria-label="Super Clipboard">
+            <span className="site-brand-logo">SC</span>
+            <span className="site-brand-main">Super Clipboard</span>
+            <span className="site-brand-sub">Cloud link workspace</span>
+          </div>
+          <div className="header-actions">
             <label className="sr-only" htmlFor="locale-select">
               {t("locale.switcherLabel")}
             </label>
@@ -793,7 +836,36 @@ const App = () => {
             </select>
             <button
               type="button"
-              className="btn btn--ghost settings-trigger"
+              className="theme-toggle"
+              onClick={handleToggleTheme}
+              aria-label={
+                isDarkTheme ? "Switch to light theme" : "Switch to dark theme"
+              }
+              title={
+                isDarkTheme ? "Switch to light theme" : "Switch to dark theme"
+              }
+            >
+              <svg className="theme-icon" viewBox="0 0 24 24" aria-hidden="true">
+                {isDarkTheme ? (
+                  <>
+                    <circle cx="12" cy="12" r="4" />
+                    <path d="M12 2v2" />
+                    <path d="M12 20v2" />
+                    <path d="m4.93 4.93 1.41 1.41" />
+                    <path d="m17.66 17.66 1.41 1.41" />
+                    <path d="M2 12h2" />
+                    <path d="M20 12h2" />
+                    <path d="m6.34 17.66-1.41 1.41" />
+                    <path d="m19.07 4.93-1.41 1.41" />
+                  </>
+                ) : (
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" />
+                )}
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="icon-button settings-trigger"
               onClick={handleOpenSettings}
               aria-label={t("hero.settings")}
               title={t("hero.settings")}
@@ -825,11 +897,22 @@ const App = () => {
             </button>
           </div>
         </div>
-        <h1>{t("hero.title")}</h1>
-        <p>{t("hero.subtitle")}</p>
       </header>
 
-      <main className="container">
+      <main className="page-shell">
+        <section className="hero-panel">
+          <div className="hero-panel__copy">
+            <span className="hero-panel__eyebrow">Super Clipboard</span>
+            <h1>{t("hero.title")}</h1>
+            <p>{t("hero.subtitle")}</p>
+          </div>
+          <div className="hero-panel__stats" aria-hidden="true">
+            <span>50 MB</span>
+            <span>{MIN_EXPIRY_HOURS}-{MAX_EXPIRY_HOURS}h</span>
+            <span>{remoteClips.length} clips</span>
+          </div>
+        </section>
+
         <section className="card">
           <div className="card__header">
             <div>
@@ -1068,6 +1151,13 @@ const App = () => {
           </div>
 
           <div className="grid">
+            {remoteClips.length === 0 ? (
+              <div className="empty-state">
+                <span className="empty-state__icon">⌘</span>
+                <h3>{t("list.summaryEmpty")}</h3>
+                <p>{t("create.description")}</p>
+              </div>
+            ) : null}
             {remoteClips.map((clip) => {
               const consumed = clip.downloadCount >= clip.maxDownloads;
               const expired = clip.expiresAt <= now;
