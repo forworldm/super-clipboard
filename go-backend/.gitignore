@@ -1,0 +1,15 @@
+# build artifacts
+bin/
+super-clipboard
+coverage.out
+
+# runtime data
+*.db
+*.db-shm
+*.db-wal
+
+# frontend bundle served by the Go binary
+dist/
+
+# local overrides
+.env

@@ -1,0 +1,719 @@
+// Package repository is the Go port of backend/repository.py.
+//
+// The SQLite schema, the on-disk layout and every user facing error message are
+// kept identical to the Python implementation so that a database produced by
+// the FastAPI backend can be reused by the Go backend (and vice versa).
+package repository
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
+
+	"github.com/pixia1234/super-clipboard/backend/internal/apperr"
+	"github.com/pixia1234/super-clipboard/backend/internal/config"
+	"github.com/pixia1234/super-clipboard/backend/internal/models"
+)
+
+// createTableStatements mirrors CREATE_TABLE_SQL from repository.py.
+var createTableStatements = []string{
+	`CREATE TABLE IF NOT EXISTS clips (
+		id TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		max_downloads INTEGER NOT NULL,
+		download_count INTEGER NOT NULL,
+		access_code TEXT UNIQUE,
+		access_token TEXT,
+		owner_id TEXT NOT NULL,
+		text_content TEXT,
+		file_name TEXT,
+		file_path TEXT,
+		file_size INTEGER,
+		file_mime TEXT
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_clips_expires_at ON clips(expires_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_clips_access_code ON clips(access_code)`,
+	`CREATE INDEX IF NOT EXISTS idx_clips_access_token ON clips(access_token)`,
+	`CREATE TABLE IF NOT EXISTS tokens (
+		token TEXT PRIMARY KEY,
+		owner_id TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		last_used_at INTEGER,
+		expires_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at)`,
+}
+
+// clipColumns keeps SELECT * behaviour stable across schema migrations.
+const clipColumns = `id, type, created_at, expires_at, max_downloads, download_count,
+	access_code, access_token, owner_id, text_content, file_name, file_path, file_size, file_mime`
+
+// TokenRecord mirrors the dict returned by register_token/ensure_token_owner.
+type TokenRecord struct {
+	Token         string
+	EnvironmentID string
+	UpdatedAt     int64
+	LastUsedAt    *int64
+	ExpiresAt     int64
+}
+
+// ClipRepository mirrors the ClipRepository class. The mutex reproduces the
+// threading.Lock that guards every write in the Python implementation.
+type ClipRepository struct {
+	settings *config.Settings
+	db       *sql.DB
+	mu       sync.Mutex
+}
+
+// NewClipRepository opens (and migrates) the SQLite database.
+func NewClipRepository(settings *config.Settings) (*ClipRepository, error) {
+	if err := os.MkdirAll(filepath.Dir(settings.DatabasePath), 0o755); err != nil {
+		return nil, fmt.Errorf("unable to create database directory: %w", err)
+	}
+	db, err := openDatabase(settings.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	repo := &ClipRepository{settings: settings, db: db}
+	if err := repo.ensureSchema(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return repo, nil
+}
+
+// Close releases the database handle.
+func (r *ClipRepository) Close() error {
+	if r.db == nil {
+		return nil
+	}
+	return r.db.Close()
+}
+
+// Settings exposes the runtime configuration (default/max downloads, token TTL).
+func (r *ClipRepository) Settings() *config.Settings { return r.settings }
+
+func openDatabase(path string) (*sql.DB, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		absolute = path
+	}
+	dsn := buildDSN(absolute)
+	db, err := sql.Open("sqlite", dsn)
+	if err == nil {
+		db.SetMaxOpenConns(8)
+		db.SetMaxIdleConns(4)
+		db.SetConnMaxLifetime(time.Hour)
+		if pingErr := db.Ping(); pingErr == nil {
+			return db, nil
+		} else {
+			db.Close()
+			err = pingErr
+		}
+	}
+	// Fallback for exotic paths: plain filename with a single serialized
+	// connection, which still provides the same guarantees.
+	db, openErr := sql.Open("sqlite", absolute)
+	if openErr != nil {
+		return nil, fmt.Errorf("unable to open sqlite database: %w", errors.Join(err, openErr))
+	}
+	db.SetMaxOpenConns(1)
+	if pingErr := db.Ping(); pingErr != nil {
+		db.Close()
+		return nil, fmt.Errorf("unable to open sqlite database: %w", errors.Join(err, pingErr))
+	}
+	if _, pragmaErr := db.Exec("PRAGMA busy_timeout=10000"); pragmaErr != nil {
+		db.Close()
+		return nil, pragmaErr
+	}
+	return db, nil
+}
+
+func buildDSN(absolutePath string) string {
+	escaped := strings.NewReplacer(
+		"%", "%25",
+		"?", "%3f",
+		"#", "%23",
+		" ", "%20",
+	).Replace(absolutePath)
+	return "file:" + escaped +
+		"?_pragma=busy_timeout(10000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)"
+}
+
+func (r *ClipRepository) ensureSchema() error {
+	for _, statement := range createTableStatements {
+		if _, err := r.db.Exec(statement); err != nil {
+			return fmt.Errorf("unable to initialize schema: %w", err)
+		}
+	}
+	rows, err := r.db.Query("PRAGMA table_info(clips)")
+	if err != nil {
+		return fmt.Errorf("unable to inspect schema: %w", err)
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			declType string
+			notNull  int
+			dflt     sql.NullString
+			pk       int
+		)
+		if err := rows.Scan(&cid, &name, &declType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("unable to inspect schema: %w", err)
+		}
+		columns[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("unable to inspect schema: %w", err)
+	}
+	if !columns["owner_id"] {
+		if _, err := r.db.Exec("ALTER TABLE clips ADD COLUMN owner_id TEXT DEFAULT ''"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+		if _, err := r.db.Exec("UPDATE clips SET owner_id = '' WHERE owner_id IS NULL"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *ClipRepository) tokenTTLSeconds() int64 {
+	hours := r.settings.TokenExpiryHours
+	if hours < 1 {
+		hours = 1
+	}
+	return int64(hours) * 60 * 60
+}
+
+func nowUnix() int64 { return time.Now().UTC().Unix() }
+
+// RegisterToken mirrors ClipRepository.register_token.
+func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*TokenRecord, error) {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return nil, &apperr.ValueError{Message: "持久 Token 无效"}
+	}
+	now := nowUnix()
+	ttl := r.tokenTTLSeconds()
+	expiresAt := now + ttl
+	var lastUsedAt *int64
+	assignedOwner := ""
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	var (
+		ownerID   string
+		updatedAt int64
+		lastUsed  sql.NullInt64
+		rowExpiry int64
+	)
+	row := tx.QueryRow("SELECT owner_id, updated_at, last_used_at, expires_at FROM tokens WHERE token = ?", trimmed)
+	err = row.Scan(&ownerID, &updatedAt, &lastUsed, &rowExpiry)
+
+	switch {
+	case err == nil:
+		if rowExpiry <= now {
+			if environmentID != nil && *environmentID != "" && *environmentID == ownerID {
+				assignedOwner = *environmentID
+			} else {
+				assignedOwner = uuid.NewString()
+			}
+			if _, execErr := tx.Exec(
+				"UPDATE tokens SET owner_id = ?, updated_at = ?, last_used_at = NULL, expires_at = ? WHERE token = ?",
+				assignedOwner, now, expiresAt, trimmed,
+			); execErr != nil {
+				return nil, execErr
+			}
+			lastUsedAt = nil
+		} else {
+			existingOwner := ownerID
+			if environmentID != nil && *environmentID != "" && *environmentID == existingOwner {
+				if _, execErr := tx.Exec(
+					"UPDATE tokens SET updated_at = ?, expires_at = ? WHERE token = ?",
+					now, expiresAt, trimmed,
+				); execErr != nil {
+					return nil, execErr
+				}
+				assignedOwner = existingOwner
+				if lastUsed.Valid {
+					value := lastUsed.Int64
+					lastUsedAt = &value
+				}
+			} else {
+				return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		if environmentID != nil && *environmentID != "" {
+			assignedOwner = *environmentID
+		} else {
+			assignedOwner = uuid.NewString()
+		}
+		if _, execErr := tx.Exec(
+			"INSERT INTO tokens (token, owner_id, updated_at, last_used_at, expires_at) VALUES (?, ?, ?, NULL, ?)",
+			trimmed, assignedOwner, now, expiresAt,
+		); execErr != nil {
+			return nil, execErr
+		}
+		lastUsedAt = nil
+	default:
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &TokenRecord{
+		Token:         trimmed,
+		EnvironmentID: assignedOwner,
+		UpdatedAt:     now,
+		LastUsedAt:    lastUsedAt,
+		ExpiresAt:     expiresAt,
+	}, nil
+}
+
+// EnsureTokenOwner mirrors ClipRepository.ensure_token_owner.
+func (r *ClipRepository) EnsureTokenOwner(token string, environmentID string) (*TokenRecord, error) {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return nil, &apperr.ValueError{Message: "持久 Token 无效"}
+	}
+	normalizedEnv := strings.TrimSpace(environmentID)
+	if normalizedEnv == "" {
+		return nil, &apperr.ValueError{Message: "Token 校验失败"}
+	}
+	now := nowUnix()
+	ttl := r.tokenTTLSeconds()
+	newExpiry := now + ttl
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var (
+		ownerID   string
+		updatedAt int64
+		lastUsed  sql.NullInt64
+		rowExpiry int64
+	)
+	row := tx.QueryRow("SELECT owner_id, updated_at, last_used_at, expires_at FROM tokens WHERE token = ?", trimmed)
+	if err := row.Scan(&ownerID, &updatedAt, &lastUsed, &rowExpiry); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &apperr.ValueError{Message: "持久 Token 未注册，请重新保存"}
+		}
+		return nil, err
+	}
+	if rowExpiry <= now {
+		if _, err := tx.Exec("DELETE FROM tokens WHERE token = ?", trimmed); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, &apperr.ValueError{Message: "持久 Token 已过期，请重新生成"}
+	}
+	if ownerID != normalizedEnv {
+		return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+	}
+	if _, err := tx.Exec(
+		"UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE token = ?",
+		now, newExpiry, trimmed,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	lastUsedAt := now
+	return &TokenRecord{
+		Token:         trimmed,
+		EnvironmentID: normalizedEnv,
+		UpdatedAt:     updatedAt,
+		LastUsedAt:    &lastUsedAt,
+		ExpiresAt:     newExpiry,
+	}, nil
+}
+
+func scanClip(scan func(dest ...interface{}) error) (*models.Clip, error) {
+	var (
+		id            string
+		clipType      string
+		createdAt     int64
+		expiresAt     int64
+		maxDownloads  int
+		downloadCount int
+		accessCode    sql.NullString
+		accessToken   sql.NullString
+		ownerID       sql.NullString
+		textContent   sql.NullString
+		fileName      sql.NullString
+		filePath      sql.NullString
+		fileSize      sql.NullInt64
+		fileMime      sql.NullString
+	)
+	if err := scan(&id, &clipType, &createdAt, &expiresAt, &maxDownloads, &downloadCount,
+		&accessCode, &accessToken, &ownerID, &textContent, &fileName, &filePath, &fileSize, &fileMime); err != nil {
+		return nil, err
+	}
+	clip := &models.Clip{
+		ID:            id,
+		Type:          clipType,
+		CreatedAt:     time.Unix(createdAt, 0).UTC(),
+		ExpiresAt:     time.Unix(expiresAt, 0).UTC(),
+		MaxDownloads:  maxDownloads,
+		DownloadCount: downloadCount,
+		EnvironmentID: ownerID.String,
+	}
+	if accessCode.Valid {
+		value := accessCode.String
+		clip.AccessCode = &value
+	}
+	if accessToken.Valid {
+		value := accessToken.String
+		clip.AccessToken = &value
+	}
+	if textContent.Valid {
+		value := textContent.String
+		clip.Text = &value
+	}
+	if filePath.Valid && filePath.String != "" {
+		clip.StoredFile = &models.StoredFile{
+			Name: fileName.String,
+			Size: fileSize.Int64,
+			Mime: fileMime.String,
+			Path: filePath.String,
+		}
+	}
+	return clip, nil
+}
+
+// SanitizeMaxDownloads mirrors ClipRepository.sanitize_max_downloads.
+func (r *ClipRepository) SanitizeMaxDownloads(value *int) int {
+	if value == nil {
+		return r.settings.DefaultMaxDownloads
+	}
+	normalized := *value
+	if normalized < 1 {
+		normalized = 1
+	}
+	if normalized > r.settings.MaxAllowedDownloads {
+		normalized = r.settings.MaxAllowedDownloads
+	}
+	return normalized
+}
+
+// CreateClipParams groups the arguments of ClipRepository.create_clip.
+type CreateClipParams struct {
+	ClipType      string
+	ExpiresAtMs   int64
+	MaxDownloads  *int
+	AccessCode    *string
+	AccessToken   *string
+	EnvironmentID string
+	Text          *string
+	StoredFile    *models.StoredFile
+}
+
+// CreateClip mirrors ClipRepository.create_clip.
+func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, error) {
+	expiresAt := time.UnixMilli(params.ExpiresAtMs).UTC()
+	if !expiresAt.After(time.Now().UTC()) {
+		return nil, &apperr.ValueError{Message: "过期时间必须晚于当前时间"}
+	}
+	environmentID := strings.TrimSpace(params.EnvironmentID)
+	if environmentID == "" {
+		return nil, &apperr.ValueError{Message: "剪贴板所属标识缺失"}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if params.AccessCode != nil && *params.AccessCode != "" {
+		var existingID string
+		err := tx.QueryRow("SELECT id FROM clips WHERE access_code = ?", *params.AccessCode).Scan(&existingID)
+		switch {
+		case err == nil:
+			return nil, &apperr.ValueError{Message: "直链码已存在，请刷新后再试"}
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return nil, err
+		}
+	}
+
+	clipID := uuid.NewString()
+	createdAt := time.Now().UTC()
+
+	var fileName, filePath, fileMime interface{}
+	var fileSize interface{}
+	if params.StoredFile != nil {
+		fileName = params.StoredFile.Name
+		filePath = params.StoredFile.Path
+		fileSize = params.StoredFile.Size
+		fileMime = params.StoredFile.Mime
+	}
+
+	if _, err := tx.Exec(`INSERT INTO clips (
+			id, type, created_at, expires_at, max_downloads,
+			download_count, access_code, access_token, owner_id, text_content,
+			file_name, file_path, file_size, file_mime
+		) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		clipID,
+		params.ClipType,
+		createdAt.Unix(),
+		expiresAt.Unix(),
+		r.SanitizeMaxDownloads(params.MaxDownloads),
+		params.AccessCode,
+		params.AccessToken,
+		environmentID,
+		params.Text,
+		fileName,
+		filePath,
+		fileSize,
+		fileMime,
+	); err != nil {
+		return nil, err
+	}
+
+	clip, err := scanClip(tx.QueryRow("SELECT "+clipColumns+" FROM clips WHERE id = ?", clipID).Scan)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return clip, nil
+}
+
+// ListClips mirrors ClipRepository.list_clips.
+func (r *ClipRepository) ListClips(environmentID string) ([]*models.Clip, error) {
+	rows, err := r.db.Query(
+		"SELECT "+clipColumns+" FROM clips WHERE owner_id = ? ORDER BY created_at DESC",
+		environmentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	clips := make([]*models.Clip, 0)
+	for rows.Next() {
+		clip, err := scanClip(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		clips = append(clips, clip)
+	}
+	return clips, rows.Err()
+}
+
+func (r *ClipRepository) queryClip(query string, args ...interface{}) (*models.Clip, error) {
+	clip, err := scanClip(r.db.QueryRow(query, args...).Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return clip, nil
+}
+
+// GetClipByCode mirrors ClipRepository.get_clip_by_code.
+func (r *ClipRepository) GetClipByCode(accessCode string) (*models.Clip, error) {
+	return r.queryClip("SELECT "+clipColumns+" FROM clips WHERE access_code = ?", accessCode)
+}
+
+// GetClipByCodeAndOwner mirrors ClipRepository.get_clip_by_code_and_owner.
+func (r *ClipRepository) GetClipByCodeAndOwner(accessCode string, environmentID string) (*models.Clip, error) {
+	return r.queryClip("SELECT "+clipColumns+" FROM clips WHERE access_code = ? AND owner_id = ?", accessCode, environmentID)
+}
+
+// GetClip mirrors ClipRepository.get_clip.
+func (r *ClipRepository) GetClip(clipID string) (*models.Clip, error) {
+	return r.queryClip("SELECT "+clipColumns+" FROM clips WHERE id = ?", clipID)
+}
+
+// GetClipByToken mirrors ClipRepository.get_clip_by_token. An empty
+// environmentID reproduces passing None from Python.
+func (r *ClipRepository) GetClipByToken(accessToken string, environmentID string) (*models.Clip, error) {
+	if environmentID != "" {
+		return r.queryClip(
+			"SELECT "+clipColumns+" FROM clips WHERE access_token = ? AND owner_id = ? ORDER BY created_at DESC",
+			accessToken, environmentID,
+		)
+	}
+	return r.queryClip(
+		"SELECT "+clipColumns+" FROM clips WHERE access_token = ? ORDER BY created_at DESC",
+		accessToken,
+	)
+}
+
+// DeleteClip mirrors ClipRepository.delete_clip, including the file cleanup.
+func (r *ClipRepository) DeleteClip(clipID string, environmentID string) (bool, error) {
+	normalizedEnv := strings.TrimSpace(environmentID)
+	if normalizedEnv == "" {
+		return false, nil
+	}
+
+	r.mu.Lock()
+	var filePath string
+	err := func() error {
+		tx, err := r.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback() //nolint:errcheck
+		var (
+			storedPath sql.NullString
+			ownerID    string
+		)
+		row := tx.QueryRow("SELECT file_path, owner_id FROM clips WHERE id = ?", clipID)
+		if err := row.Scan(&storedPath, &ownerID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return sql.ErrNoRows
+			}
+			return err
+		}
+		if ownerID != normalizedEnv {
+			return sql.ErrNoRows
+		}
+		if _, err := tx.Exec("DELETE FROM clips WHERE id = ?", clipID); err != nil {
+			return err
+		}
+		filePath = storedPath.String
+		return tx.Commit()
+	}()
+	r.mu.Unlock()
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if filePath != "" {
+		_ = os.Remove(filePath)
+	}
+	return true, nil
+}
+
+// IncrementDownloads mirrors ClipRepository.increment_downloads and returns the
+// refreshed clip plus the "reached the download limit" flag.
+func (r *ClipRepository) IncrementDownloads(clipID string, environmentID string) (*models.Clip, bool, error) {
+	normalizedEnv := strings.TrimSpace(environmentID)
+	if normalizedEnv == "" {
+		return nil, false, nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	clip, err := scanClip(tx.QueryRow("SELECT "+clipColumns+" FROM clips WHERE id = ?", clipID).Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if clip.EnvironmentID != normalizedEnv {
+		return nil, false, nil
+	}
+	newCount := clip.DownloadCount + 1
+	if _, err := tx.Exec("UPDATE clips SET download_count = ? WHERE id = ?", newCount, clipID); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	clip.DownloadCount = newCount
+	return clip, newCount >= clip.MaxDownloads, nil
+}
+
+// PurgeInactive mirrors ClipRepository.purge_inactive.
+func (r *ClipRepository) PurgeInactive() (int, error) {
+	now := nowUnix()
+
+	r.mu.Lock()
+	rows, err := r.db.Query(
+		"SELECT id, file_path FROM clips WHERE expires_at <= ? OR download_count >= max_downloads",
+		now,
+	)
+	if err != nil {
+		r.mu.Unlock()
+		return 0, err
+	}
+	type pending struct {
+		id       string
+		filePath string
+	}
+	var victims []pending
+	for rows.Next() {
+		var (
+			id       string
+			filePath sql.NullString
+		)
+		if err := rows.Scan(&id, &filePath); err != nil {
+			rows.Close()
+			r.mu.Unlock()
+			return 0, err
+		}
+		victims = append(victims, pending{id: id, filePath: filePath.String})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		r.mu.Unlock()
+		return 0, err
+	}
+	for _, victim := range victims {
+		if _, err := r.db.Exec("DELETE FROM clips WHERE id = ?", victim.id); err != nil {
+			r.mu.Unlock()
+			return 0, err
+		}
+	}
+	r.mu.Unlock()
+
+	for _, victim := range victims {
+		if victim.filePath != "" {
+			_ = os.Remove(victim.filePath)
+		}
+	}
+	return len(victims), nil
+}
