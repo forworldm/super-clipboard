@@ -37,23 +37,66 @@ type Settings struct {
 	CaptchaTimeoutSeconds  float64
 	CaptchaBypassToken     string
 	CaptchaSiteKey         string
+	// Chunked upload settings (server-generated, never trust client values).
+	UploadChunkSizeBytes   int
+	UploadSessionTTLSeconds int
 }
 
 // Defaults returns the same defaults as the Python Settings class.
 func Defaults() *Settings {
 	return &Settings{
-		DatabasePath:           "backend/storage/clipboard.db",
-		FileStorageDir:         "backend/storage/files",
-		AppHost:                "0.0.0.0",
-		AppPort:                5173,
-		DefaultMaxDownloads:    10,
-		MaxAllowedDownloads:    500,
-		CleanupIntervalSeconds: 300,
-		MaxFileSizeBytes:       50 * 1024 * 1024,
-		TokenExpiryHours:       720,
-		StaticRoot:             "dist",
-		CaptchaTimeoutSeconds:  6.0,
+		DatabasePath:            "backend/storage/clipboard.db",
+		FileStorageDir:          "backend/storage/files",
+		AppHost:                 "0.0.0.0",
+		AppPort:                 5173,
+		DefaultMaxDownloads:     10,
+		MaxAllowedDownloads:     500,
+		CleanupIntervalSeconds:  300,
+		MaxFileSizeBytes:        50 * 1024 * 1024,
+		TokenExpiryHours:        720,
+		StaticRoot:              "dist",
+		CaptchaTimeoutSeconds:   6.0,
+		UploadChunkSizeBytes:    1 << 20, // 1 MiB per chunk, server-generated
+		UploadSessionTTLSeconds: 24 * 60 * 60, // 24h resume window
 	}
+}
+
+// MinUploadChunkSizeBytes / MaxUploadChunkSizeBytes bound the server-generated
+// chunk size so a misconfigured env cannot produce absurd sessions.
+const (
+	MinUploadChunkSizeBytes = 64 << 10       // 64 KiB
+	MaxUploadChunkSizeBytes = 8 << 20        // 8 MiB
+	MinUploadTTLSeconds     = 60             // 1 minute (tests use small TTLs)
+	MaxUploadTTLSeconds     = 7 * 24 * 3600  // 7 days
+)
+
+// EffectiveChunkSize returns a sane chunk size even if Settings was built
+// manually in tests without going through Defaults()/Load().
+func (s *Settings) EffectiveChunkSize() int {
+	if s == nil || s.UploadChunkSizeBytes <= 0 {
+		return 1 << 20
+	}
+	if s.UploadChunkSizeBytes < MinUploadChunkSizeBytes {
+		return MinUploadChunkSizeBytes
+	}
+	if s.UploadChunkSizeBytes > MaxUploadChunkSizeBytes {
+		return MaxUploadChunkSizeBytes
+	}
+	return s.UploadChunkSizeBytes
+}
+
+// EffectiveUploadTTL returns a sane session TTL in seconds.
+func (s *Settings) EffectiveUploadTTL() int {
+	if s == nil || s.UploadSessionTTLSeconds <= 0 {
+		return 24 * 60 * 60
+	}
+	if s.UploadSessionTTLSeconds < MinUploadTTLSeconds {
+		return MinUploadTTLSeconds
+	}
+	if s.UploadSessionTTLSeconds > MaxUploadTTLSeconds {
+		return MaxUploadTTLSeconds
+	}
+	return s.UploadSessionTTLSeconds
 }
 
 // CaptchaEnabled reports whether a captcha provider is configured.
@@ -165,12 +208,18 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		func() error { return int64Var("MAX_FILE_SIZE_BYTES", &s.MaxFileSizeBytes) },
 		func() error { return intVar("TOKEN_EXPIRY_HOURS", &s.TokenExpiryHours) },
 		func() error { return floatVar("CAPTCHA_TIMEOUT_SECONDS", &s.CaptchaTimeoutSeconds) },
+		func() error { return intVar("UPLOAD_CHUNK_SIZE_BYTES", &s.UploadChunkSizeBytes) },
+		func() error { return intVar("UPLOAD_SESSION_TTL_SECONDS", &s.UploadSessionTTLSeconds) },
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
 			return nil, err
 		}
 	}
+	// Clamp chunked-upload knobs so a bad env cannot break the protocol.
+	// Effective*() also guards hand-built Settings in tests.
+	s.UploadChunkSizeBytes = s.EffectiveChunkSize()
+	s.UploadSessionTTLSeconds = s.EffectiveUploadTTL()
 
 	// @field_validator("captcha_provider") normalize_provider
 	if value, ok := lookup("CAPTCHA_PROVIDER"); ok {

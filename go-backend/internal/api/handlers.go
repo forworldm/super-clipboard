@@ -18,9 +18,8 @@ import (
 	"github.com/pixia1234/super-clipboard/backend/internal/utils"
 )
 
-// maxBodyBytes caps request bodies (a 50MB upload becomes ~67MB of base64).
-// The value is a var so tests can lower it without allocating a 512MiB payload.
-var maxBodyBytes int64 = 512 << 20
+// Files are streamed in chunks, this value only affects regular text clips.
+var maxBodyBytes int64 = 1 << 20
 
 // readBody consumes the request body like FastAPI does before validation.
 // Bodies larger than maxBodyBytes yield 413 instead of a truncated JSON parse.
@@ -189,24 +188,7 @@ func (a *App) handleCreateClip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if a.Settings.CaptchaEnabled() {
-		if !a.Settings.HasCaptchaSecret() {
-			writeError(w, newHTTPError(http.StatusInternalServerError, "验证码服务未正确配置"))
-			return
-		}
-		clientIP := utils.ExtractClientIP(r)
-		// 避免代理导致的内网地址与浏览器求解 IP 不一致
-		if utils.IsPrivateAddress(clientIP) {
-			clientIP = ""
-		}
-		if err := utils.VerifyCaptchaToken(r.Context(), request.CaptchaToken, utils.CaptchaOptions{
-			Provider:    a.Settings.CaptchaProvider,
-			Secret:      a.Settings.CaptchaSecret,
-			RemoteIP:    clientIP,
-			Timeout:     time.Duration(a.Settings.CaptchaTimeoutSeconds * float64(time.Second)),
-			BypassToken: a.Settings.CaptchaBypassToken,
-			Client:      a.client,
-		}); err != nil {
-			writeError(w, err)
+		if !a.verifyCaptcha(w, r, request.CaptchaToken, request.CaptchaProvider) {
 			return
 		}
 	}
@@ -439,7 +421,11 @@ func (a *App) handleRegisterToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
-	response := schemas.AppConfigResponse{}
+	response := schemas.AppConfigResponse{
+		MaxFileSizeBytes:        a.Settings.MaxFileSizeBytes,
+		UploadChunkSizeBytes:    a.Settings.EffectiveChunkSize(),
+		UploadSessionTTLSeconds: a.Settings.EffectiveUploadTTL(),
+	}
 	if a.Settings.CaptchaProvider != "" {
 		provider := a.Settings.CaptchaProvider
 		response.CaptchaProvider = &provider

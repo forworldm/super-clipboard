@@ -71,6 +71,13 @@ func NewApp(settings *config.Settings, repo *repository.ClipRepository) *App {
 	app.router.add("/api/clips/{clip_id}/download", []string{http.MethodPost}, app.handleTrackDownload)
 	app.router.add("/api/clips/{clip_id}/file", []string{http.MethodGet}, app.handleDownloadFile)
 
+	// Chunked uploads (must precede /{access_code} catch-alls).
+	app.router.add("/api/uploads/init", []string{http.MethodPost}, app.handleInitUpload)
+	app.router.add("/api/uploads/{id}/chunks/{index}", []string{http.MethodPut}, app.handlePutChunk)
+	app.router.add("/api/uploads/{id}", []string{http.MethodGet}, app.handleGetUpload)
+	app.router.add("/api/uploads/{id}/complete", []string{http.MethodPost}, app.handleCompleteUpload)
+	app.router.add("/api/uploads/{id}", []string{http.MethodDelete}, app.handleAbortUpload)
+
 	app.router.add("/{access_code}/raw", []string{http.MethodGet}, app.handleResolveRaw)
 	app.router.add("/{access_code}", []string{http.MethodGet}, app.handleResolve)
 
@@ -223,6 +230,8 @@ func (a *App) RunWithContext(ctx context.Context) error {
 	} else if purged > 0 {
 		a.logger.Printf("INFO:     startup purge removed %d inactive clip(s)", purged)
 	}
+	// Chunked-upload crash recovery (power loss / kill -9 mid-assembly).
+	a.ReconcileUploadsOnStartup()
 
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
@@ -283,6 +292,9 @@ func (a *App) cleanupWorker(ctx context.Context) {
 			if _, err := a.Repo.PurgeInactive(); err != nil {
 				a.logger.Printf("ERROR:    cleanup worker failed: %v", err)
 			}
+			// Timeout rollback for abandoned upload sessions (cancel without
+			// DELETE, network drop, browser closed mid-upload).
+			a.purgeExpiredUploadsPeriodic()
 		}
 	}
 }

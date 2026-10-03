@@ -24,6 +24,8 @@ type HoursMinutesParams = { hours: number; minutes: number };
 type HoursParams = { hours: number };
 type MinutesParams = { minutes: number };
 type ReasonParams = { reason: string };
+type UploadRetryParams = { index: number; attempt: number; max: number };
+type UploadProgressParams = { uploaded: number; total: number; percent: number };
 
 const toRange = (params?: Record<string, unknown>): RangeParams => {
   const { min = 0, max = 0 } = (params ?? {}) as Partial<RangeParams>;
@@ -103,6 +105,20 @@ const toMinutes = (params?: Record<string, unknown>): MinutesParams => {
 const toReason = (params?: Record<string, unknown>): ReasonParams => {
   const { reason = "" } = (params ?? {}) as Partial<ReasonParams>;
   return { reason: String(reason) };
+};
+
+const toUploadRetry = (params?: Record<string, unknown>): UploadRetryParams => {
+  const { index = 0, attempt = 0, max = 0 } =
+    (params ?? {}) as Partial<UploadRetryParams>;
+  return { index, attempt, max };
+};
+
+const toUploadProgress = (
+  params?: Record<string, unknown>
+): UploadProgressParams => {
+  const { uploaded = 0, total = 0, percent = 0 } =
+    (params ?? {}) as Partial<UploadProgressParams>;
+  return { uploaded, total, percent };
 };
 
 const zhCN: TranslationDictionary = {
@@ -295,7 +311,41 @@ const zhCN: TranslationDictionary = {
   "copy.target.directLink": "访问直链",
   "copy.target.token": "Token",
   "copy.target.text": "文本",
-  "copy.target.file": "文件"
+  "copy.target.file": "文件",
+
+  "upload.initializing": "正在初始化上传…",
+  "upload.resuming": "检测到未完成的上传，正在续传…",
+  "upload.uploading": "正在上传分片…",
+  "upload.retrying": (params) => {
+    const { index, attempt, max } = toUploadRetry(params);
+    return `分片 ${index} 上传失败，正在重试（${attempt}/${max}）…`;
+  },
+  "upload.assembling": "正在合并文件…",
+  "upload.cancel": "取消上传",
+  "upload.cancelling": "正在取消…",
+  "upload.cancelled": "上传已取消",
+  "upload.failed": "上传失败，请重试",
+  "upload.timeout": "上传超时，请检查网络后重试",
+  "upload.networkError": "网络中断，上传已暂停，可重试继续",
+  "upload.sessionExpired": "上传会话已过期，请重新上传",
+  "upload.sessionNotFound": "上传会话不存在，请重新上传",
+  "upload.progressLabel": (params) => {
+    const { uploaded, total, percent } = toUploadProgress(params);
+    return `${uploaded}/${total} 分片 · ${percent}%`;
+  },
+  "upload.completeFailed": (params) => {
+    const { reason } = toReason(params);
+    return `文件合并失败：${reason}`;
+  },
+  "toast.uploadCancelled": "文件上传已取消",
+  "toast.uploadFailed": (params) => {
+    const { reason } = toReason(params);
+    return `文件上传失败：${reason}`;
+  },
+  "toast.uploadTimeout": "上传超时，请检查网络后重试",
+  "toast.uploadSessionExpired": "上传会话已过期，请重新选择文件上传",
+  "buttons.cancelUpload": "取消上传",
+  "buttons.retryUpload": "重试上传"
 };
 
 const en: TranslationDictionary = {
@@ -495,7 +545,41 @@ const en: TranslationDictionary = {
   "copy.target.directLink": "direct link",
   "copy.target.token": "token",
   "copy.target.text": "text",
-  "copy.target.file": "file"
+  "copy.target.file": "file",
+
+  "upload.initializing": "Initializing upload…",
+  "upload.resuming": "Resuming unfinished upload…",
+  "upload.uploading": "Uploading chunks…",
+  "upload.retrying": (params) => {
+    const { index, attempt, max } = toUploadRetry(params);
+    return `Chunk ${index} failed, retrying (${attempt}/${max})…`;
+  },
+  "upload.assembling": "Assembling file…",
+  "upload.cancel": "Cancel upload",
+  "upload.cancelling": "Cancelling…",
+  "upload.cancelled": "Upload cancelled",
+  "upload.failed": "Upload failed. Please retry.",
+  "upload.timeout": "Upload timed out. Check your connection and retry.",
+  "upload.networkError": "Network interrupted. Upload paused — retry to resume.",
+  "upload.sessionExpired": "Upload session expired. Please re-upload.",
+  "upload.sessionNotFound": "Upload session not found. Please re-upload.",
+  "upload.progressLabel": (params) => {
+    const { uploaded, total, percent } = toUploadProgress(params);
+    return `${uploaded}/${total} chunks · ${percent}%`;
+  },
+  "upload.completeFailed": (params) => {
+    const { reason } = toReason(params);
+    return `Failed to assemble file: ${reason}`;
+  },
+  "toast.uploadCancelled": "File upload cancelled.",
+  "toast.uploadFailed": (params) => {
+    const { reason } = toReason(params);
+    return `File upload failed: ${reason}`;
+  },
+  "toast.uploadTimeout": "Upload timed out. Check your connection and retry.",
+  "toast.uploadSessionExpired": "Upload session expired. Please reselect the file.",
+  "buttons.cancelUpload": "Cancel upload",
+  "buttons.retryUpload": "Retry upload"
 };
 
 const ja: TranslationDictionary = {
@@ -693,7 +777,41 @@ const ja: TranslationDictionary = {
   "copy.target.directLink": "ダイレクトリンク",
   "copy.target.token": "トークン",
   "copy.target.text": "テキスト",
-  "copy.target.file": "ファイル"
+  "copy.target.file": "ファイル",
+
+  "upload.initializing": "アップロードを初期化中…",
+  "upload.resuming": "未完了のアップロードを再開しています…",
+  "upload.uploading": "チャンクをアップロード中…",
+  "upload.retrying": (params) => {
+    const { index, attempt, max } = toUploadRetry(params);
+    return `チャンク ${index} に失敗しました。再試行中（${attempt}/${max}）…`;
+  },
+  "upload.assembling": "ファイルを結合中…",
+  "upload.cancel": "アップロードをキャンセル",
+  "upload.cancelling": "キャンセル中…",
+  "upload.cancelled": "アップロードをキャンセルしました",
+  "upload.failed": "アップロードに失敗しました。再試行してください。",
+  "upload.timeout": "アップロードがタイムアウトしました。接続を確認して再試行してください。",
+  "upload.networkError": "ネットワークが中断されました。アップロードを一時停止しました。再試行で再開できます。",
+  "upload.sessionExpired": "アップロードセッションの期限が切れました。再度アップロードしてください。",
+  "upload.sessionNotFound": "アップロードセッションが見つかりません。再度アップロードしてください。",
+  "upload.progressLabel": (params) => {
+    const { uploaded, total, percent } = toUploadProgress(params);
+    return `${uploaded}/${total} チャンク · ${percent}%`;
+  },
+  "upload.completeFailed": (params) => {
+    const { reason } = toReason(params);
+    return `ファイルの結合に失敗しました: ${reason}`;
+  },
+  "toast.uploadCancelled": "ファイルのアップロードをキャンセルしました。",
+  "toast.uploadFailed": (params) => {
+    const { reason } = toReason(params);
+    return `ファイルのアップロードに失敗しました: ${reason}`;
+  },
+  "toast.uploadTimeout": "アップロードがタイムアウトしました。接続を確認して再試行してください。",
+  "toast.uploadSessionExpired": "アップロードセッションの期限が切れました。ファイルを選択し直してください。",
+  "buttons.cancelUpload": "アップロードをキャンセル",
+  "buttons.retryUpload": "再試行"
 };
 
 export const translations: Record<Locale, TranslationDictionary> = {

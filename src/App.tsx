@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   useClipboardStore,
   ClipType,
@@ -20,6 +20,7 @@ import {
   fetchAppConfig,
   type AppConfig
 } from "./utils/api";
+import { uploadFileChunked, type UploadProgress } from "./utils/uploads";
 import "./App.css";
 import { useI18n } from "./i18n/I18nProvider";
 import type { Locale } from "./i18n/locales";
@@ -54,10 +55,10 @@ const MAX_DOWNLOADS_OPTIONS = [3, 5, 10, 20, 50, 100];
 const SUPPORTED_CAPTCHA_PROVIDERS: readonly CaptchaProviderType[] = ["turnstile", "recaptcha"] as const;
 
 type DraftFile = {
+  file: File;
   name: string;
   size: number;
   type: string;
-  dataUrl: string;
 };
 
 type ThemeMode = "light" | "dark";
@@ -114,6 +115,9 @@ const App = () => {
   );
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isCreatingClip, setIsCreatingClip] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [isCancellingUpload, setIsCancellingUpload] = useState(false);
+  const uploadControllerRef = useRef<AbortController | null>(null);
 
   const [toast, setToast] = useState<ToastState | null>(emptyToast);
   const [isImportingClipboard, setIsImportingClipboard] = useState(false);
@@ -328,6 +332,14 @@ const App = () => {
     });
   };
 
+  const effectiveMaxFileSize = useMemo(() => {
+    const serverMax = captchaConfig?.maxFileSizeBytes;
+    if (typeof serverMax === "number" && Number.isFinite(serverMax) && serverMax > 0) {
+      return serverMax;
+    }
+    return MAX_FILE_SIZE_BYTES;
+  }, [captchaConfig?.maxFileSizeBytes]);
+
   const processFile = useCallback(
     async (
       file: File,
@@ -335,7 +347,9 @@ const App = () => {
         fallbackName?: string;
       }
     ): Promise<boolean> => {
-      if (file.size > MAX_FILE_SIZE_BYTES) {
+      // Chunked upload: keep the File handle (sliced per chunk on demand)
+      // instead of base64-ing the whole file into memory (old dataUrl path).
+      if (file.size > effectiveMaxFileSize) {
         setToast({
           kind: "error",
           message: t("toast.fileTooLarge")
@@ -348,12 +362,11 @@ const App = () => {
         (file.name && file.name.trim()) || options?.fallbackName || "clipboard-upload";
 
       try {
-        const dataUrl = await readFileAsDataUrl(file);
         setSelectedFile({
+          file,
           name: resolvedName,
           size: file.size,
-          type: file.type,
-          dataUrl
+          type: file.type
         });
         return true;
       } catch (error) {
@@ -366,7 +379,7 @@ const App = () => {
         return false;
       }
     },
-    [t]
+    [effectiveMaxFileSize, t]
   );
 
   useEffect(() => {
@@ -441,6 +454,39 @@ const App = () => {
     const success = await processFile(file);
     if (!success) {
       event.target.value = "";
+    }
+  };
+
+  const handleCancelUpload = () => {
+    const ctrl = uploadControllerRef.current;
+    if (!ctrl || isCancellingUpload) return;
+    setIsCancellingUpload(true);
+    ctrl.abort();
+  };
+
+  const describeUploadStatus = (progress: UploadProgress): string => {
+    switch (progress.status) {
+      case "initializing":
+        return t("upload.initializing");
+      case "resuming":
+        return t("upload.resuming");
+      case "retrying":
+        return t("upload.retrying", {
+          index: progress.failedIndex ?? 0,
+          attempt: progress.attempt ?? 1,
+          max: progress.maxAttempts ?? 1
+        });
+      case "assembling":
+        return t("upload.assembling");
+      case "cancelled":
+        return t("upload.cancelled");
+      case "failed":
+        return t("upload.failed");
+      case "completed":
+        return t("toast.createSuccess.file");
+      case "uploading":
+      default:
+        return t("upload.uploading");
     }
   };
 
@@ -550,6 +596,106 @@ const App = () => {
       return;
     }
 
+    // File path: chunked multi-POST upload (no giant base64 body).
+    if (type === "file" && selectedFile) {
+      const controller = new AbortController();
+      uploadControllerRef.current = controller;
+      setIsCreatingClip(true);
+      setIsCancellingUpload(false);
+      setUploadProgress({
+        uploadId: null,
+        uploadedBytes: 0,
+        totalBytes: selectedFile.size,
+        uploadedChunks: 0,
+        totalChunks: 0,
+        percent: 0,
+        status: "initializing"
+      });
+      try {
+        const created = await uploadFileChunked({
+          file: selectedFile.file,
+          filename: selectedFile.name,
+          environmentId: settings.environmentId,
+          clip: {
+            environmentId: settings.environmentId,
+            expiresAt: Date.now() + hoursToMilliseconds(expiresInHours),
+            maxDownloads,
+            accessCode: accessMode === "code" ? activeShortCode : undefined,
+            accessToken: usingToken ? tokenValue : undefined
+          },
+          // Captcha is verified once at init (before any chunk consumes
+          // storage); the complete call deliberately does not re-send it
+          // because Turnstile tokens are single-use.
+          captchaToken: isCaptchaEnabled ? captchaToken : undefined,
+          captchaProvider: captchaProvider ?? undefined,
+          concurrency: 3,
+          signal: controller.signal,
+          onProgress: (p) => setUploadProgress({ ...p })
+        });
+
+        upsertRemoteClip(created);
+        setToast({
+          kind: "success",
+          message: t("toast.createSuccess.file")
+        });
+
+        if (usingToken) {
+          updateSettings({
+            tokenLastUsedAt: nowTs
+          });
+        }
+
+        if (accessMode === "code") {
+          setShortCode(generateAccessCode());
+        }
+        resetForm();
+        setUploadProgress(null);
+      } catch (error) {
+        if (
+          (error instanceof DOMException && error.name === "AbortError") ||
+          (error instanceof Error && error.message.toLowerCase().includes("cancel"))
+        ) {
+          setToast({ kind: "info", message: t("toast.uploadCancelled") });
+          setUploadProgress((prev) =>
+            prev ? { ...prev, status: "cancelled" } : prev
+          );
+        } else {
+          const status = (error as Error & { status?: number }).status;
+          const isTimeout =
+            (error as Error & { timeout?: boolean }).timeout === true ||
+            (error instanceof Error && error.message.toLowerCase().includes("timeout"));
+          if (status === 410) {
+            setToast({ kind: "error", message: t("toast.uploadSessionExpired") });
+          } else if (isTimeout) {
+            setToast({ kind: "error", message: t("toast.uploadTimeout") });
+          } else {
+            const reason =
+              error instanceof Error ? error.message : t("toast.createFailed");
+            // Network drop without status: hint that retry resumes.
+            if (status === undefined && reason && /failed to fetch|network|load failed/i.test(reason)) {
+              setToast({ kind: "error", message: t("upload.networkError") });
+            } else {
+              setToast({
+                kind: "error",
+                message: t("toast.uploadFailed", { reason })
+              });
+            }
+          }
+          setUploadProgress((prev) =>
+            prev ? { ...prev, status: "failed" } : prev
+          );
+        }
+      } finally {
+        uploadControllerRef.current = null;
+        setIsCreatingClip(false);
+        setIsCancellingUpload(false);
+        if (isCaptchaEnabled) {
+          resetCaptcha();
+        }
+      }
+      return;
+    }
+
     setIsCreatingClip(true);
     try {
       const created = await createRemoteClip({
@@ -561,19 +707,13 @@ const App = () => {
         accessToken: usingToken ? tokenValue : undefined,
         captchaToken: isCaptchaEnabled ? captchaToken : undefined,
         captchaProvider: captchaProvider ?? undefined,
-        payload:
-          type === "text"
-            ? { text: trimmedText }
-            : { file: selectedFile ?? undefined }
+        payload: { text: trimmedText }
       });
 
       upsertRemoteClip(created);
       setToast({
         kind: "success",
-        message:
-          type === "text"
-            ? t("toast.createSuccess.text")
-            : t("toast.createSuccess.file")
+        message: t("toast.createSuccess.text")
       });
 
       if (usingToken) {
@@ -990,6 +1130,55 @@ const App = () => {
                     )}
                   </label>
                 )}
+
+                {uploadProgress && type === "file" ? (
+                  <div className="upload-progress" role="status" aria-live="polite">
+                    <div className="upload-progress__head">
+                      <span className="upload-progress__label">
+                        {describeUploadStatus(uploadProgress)}
+                      </span>
+                      <span className="upload-progress__percent">
+                        {uploadProgress.totalBytes === 0
+                          ? "100%"
+                          : `${uploadProgress.percent}%`}
+                      </span>
+                    </div>
+                    <div className="upload-progress__bar" aria-hidden="true">
+                      <div
+                        className={`upload-progress__fill upload-progress__fill--${uploadProgress.status}`}
+                        style={{ width: `${uploadProgress.totalBytes === 0 ? 100 : uploadProgress.percent}%` }}
+                      />
+                    </div>
+                    <div className="upload-progress__foot">
+                      <span className="muted small">
+                        {t("upload.progressLabel", {
+                          uploaded: uploadProgress.uploadedChunks,
+                          total: uploadProgress.totalChunks,
+                          percent: uploadProgress.percent
+                        })}
+                        {" · "}
+                        {formatBytes(uploadProgress.uploadedBytes)} / {formatBytes(uploadProgress.totalBytes)}
+                      </span>
+                      {(uploadProgress.status === "uploading" ||
+                        uploadProgress.status === "retrying" ||
+                        uploadProgress.status === "resuming" ||
+                        uploadProgress.status === "initializing" ||
+                        uploadProgress.status === "assembling") ? (
+                        <button
+                          type="button"
+                          className="btn btn--tiny btn--danger"
+                          onClick={handleCancelUpload}
+                          disabled={isCancellingUpload}
+                        >
+                          {isCancellingUpload
+                            ? t("upload.cancelling")
+                            : t("buttons.cancelUpload")}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
               </div>
 
               <div className="stack">
@@ -1369,13 +1558,5 @@ const App = () => {
     </div>
   );
 };
-
-const readFileAsDataUrl = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 
 export default App;

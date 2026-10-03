@@ -122,6 +122,202 @@ type RegisterTokenResponse = {
 export type AppConfig = {
   captchaProvider?: "turnstile" | "recaptcha";
   captchaSiteKey?: string;
+  maxFileSizeBytes?: number;
+  uploadChunkSizeBytes?: number;
+  uploadSessionTTLSeconds?: number;
+};
+
+// ---------------------------------------------------------------------------
+// Chunked uploads (server-generated uploadId/chunkSize, raw chunk bytes).
+// ---------------------------------------------------------------------------
+
+export type UploadInitResponse = {
+  uploadId: string;
+  chunkSize: number;
+  totalChunks: number;
+  fileSize: number;
+  filename: string;
+  mimeType: string;
+  expiresAt: number;
+  // "active" for fresh uploads; "completed" when an idempotent init replay
+  // lands on an already-merged session (client should call complete as-is,
+  // which replays the previously created clip instead of re-creating one).
+  status: string;
+  // Populated on idempotent replays (already-received chunk indices);
+  // empty array for brand-new sessions.
+  receivedChunks: number[];
+};
+
+export type UploadInfoResponse = {
+  uploadId: string;
+  filename: string;
+  fileSize: number;
+  mimeType: string;
+  chunkSize: number;
+  totalChunks: number;
+  receivedChunks: number[];
+  receivedCount: number;
+  missingChunks: number[];
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+};
+
+export type UploadChunkResponse = {
+  uploadId: string;
+  index: number;
+  receivedCount: number;
+  totalChunks: number;
+  receivedChunks: number[];
+  complete: boolean;
+};
+
+export type UploadCompleteClipParams = {
+  environmentId: string;
+  expiresAt: number;
+  maxDownloads?: number;
+  accessCode?: string;
+  accessToken?: string;
+  // Note: captcha is NOT part of complete anymore. Captcha is verified once
+  // at init (before any chunk consumes storage), and Turnstile tokens are
+  // single-use by design — re-sending would fail the idempotent complete
+  // replay path unnecessarily.
+};
+
+export type UploadInitParams = {
+  filename: string;
+  fileSize: number;
+  mimeType?: string;
+  environmentId?: string;
+  // Client-generated idempotency key: safe init retries return the same
+  // session (replay) instead of creating a duplicate session on disk.
+  requestId?: string;
+  captchaToken?: string;
+  captchaProvider?: "turnstile" | "recaptcha";
+};
+
+const requestRaw = async <T>(
+  input: RequestInfo,
+  init?: RequestInit
+): Promise<T> => {
+  const response = await fetch(input, init);
+  if (!response.ok) {
+    let detail: unknown = null;
+    try {
+      detail = await response.json();
+    } catch {
+      try {
+        detail = await response.text();
+      } catch {
+        detail = null;
+      }
+    }
+    const payload =
+      typeof detail === "string" ? { message: detail } : (detail as Record<string, unknown> | null);
+    const data = (payload ?? {}) as {
+      detail?: unknown;
+      Detail?: unknown;
+      error?: unknown;
+      message?: unknown;
+      missing?: unknown;
+    };
+    const rawDetail = data.detail ?? data.Detail ?? data.error ?? data.message;
+    const message =
+      typeof rawDetail === "string"
+        ? rawDetail
+        : Array.isArray(rawDetail)
+        ? JSON.stringify(rawDetail)
+        : "请求失败";
+    const error = new Error(message) as Error & {
+      status?: number;
+      missing?: number[];
+    };
+    error.status = response.status;
+    if (Array.isArray(data.missing)) {
+      error.missing = (data.missing as unknown[]).filter(
+        (v): v is number => typeof v === "number"
+      );
+    }
+    throw error;
+  }
+  return (await response.json()) as T;
+};
+
+export const initFileUpload = async (
+  params: UploadInitParams
+): Promise<UploadInitResponse> => {
+  const body: Record<string, unknown> = {
+    filename: params.filename,
+    fileSize: params.fileSize,
+    mimeType: params.mimeType ?? "application/octet-stream",
+    environmentId: params.environmentId ?? ""
+  };
+  if (params.requestId) body.requestId = params.requestId;
+  if (params.captchaToken) body.captchaToken = params.captchaToken;
+  if (params.captchaProvider) body.captchaProvider = params.captchaProvider;
+  return request<UploadInitResponse>(`${API_BASE}/uploads/init`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+};
+
+export const getUploadInfo = async (
+  uploadId: string
+): Promise<UploadInfoResponse> => {
+  return request<UploadInfoResponse>(
+    `${API_BASE}/uploads/${encodeURIComponent(uploadId)}`
+  );
+};
+
+export const uploadChunkBytes = async (
+  uploadId: string,
+  index: number,
+  blob: Blob,
+  opts?: { signal?: AbortSignal }
+): Promise<UploadChunkResponse> => {
+  return requestRaw<UploadChunkResponse>(
+    `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: blob,
+      signal: opts?.signal
+    }
+  );
+};
+
+export const completeUploadAsClip = async (
+  uploadId: string,
+  clip: UploadCompleteClipParams,
+  opts?: { signal?: AbortSignal }
+): Promise<RemoteClip> => {
+  const data = await requestRaw<ApiClip>(
+    `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(clip),
+      signal: opts?.signal
+    }
+  );
+  return mapClip(data);
+};
+
+export const completeUploadFileOnly = async (
+  uploadId: string,
+  opts?: { signal?: AbortSignal }
+): Promise<{ uploadId: string; status: string }> => {
+  return requestRaw(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}/complete`, {
+    method: "POST",
+    signal: opts?.signal
+  });
+};
+
+export const abortFileUpload = async (uploadId: string): Promise<void> => {
+  await request(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}`, {
+    method: "DELETE"
+  });
 };
 
 export const registerPersistentToken = async (

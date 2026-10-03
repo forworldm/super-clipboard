@@ -309,9 +309,14 @@ type IncrementResponse struct {
 }
 
 // AppConfigResponse mirrors AppConfigResponse.
+// Upload knobs are server-generated; the frontend reads them for display and
+// uses the per-session chunkSize from init (never its own guess).
 type AppConfigResponse struct {
-	CaptchaProvider *string `json:"captchaProvider"`
-	CaptchaSiteKey  *string `json:"captchaSiteKey"`
+	CaptchaProvider         *string `json:"captchaProvider"`
+	CaptchaSiteKey          *string `json:"captchaSiteKey"`
+	MaxFileSizeBytes        int64   `json:"maxFileSizeBytes"`
+	UploadChunkSizeBytes    int     `json:"uploadChunkSizeBytes"`
+	UploadSessionTTLSeconds int     `json:"uploadSessionTTLSeconds"`
 }
 
 // TokenRegisterResponse mirrors TokenRegisterResponse.

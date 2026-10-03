@@ -24,6 +24,8 @@ import (
 )
 
 // createTableStatements mirrors CREATE_TABLE_SQL from repository.py.
+// The upload_* tables are new (chunked upload sessions) and are additive:
+// existing clips/tokens databases migrate automatically via IF NOT EXISTS.
 var createTableStatements = []string{
 	`CREATE TABLE IF NOT EXISTS clips (
 		id TEXT PRIMARY KEY,
@@ -52,7 +54,39 @@ var createTableStatements = []string{
 		expires_at INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at)`,
+	`CREATE TABLE IF NOT EXISTS upload_sessions (
+		id TEXT PRIMARY KEY,
+		filename TEXT NOT NULL,
+		file_size INTEGER NOT NULL,
+		mime_type TEXT NOT NULL,
+		chunk_size INTEGER NOT NULL,
+		total_chunks INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		environment_id TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		staged_path TEXT,
+		clip_id TEXT,
+		request_id TEXT
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_expires_at ON upload_sessions(expires_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status)`,
+	`CREATE TABLE IF NOT EXISTS upload_chunks (
+		upload_id TEXT NOT NULL,
+		chunk_index INTEGER NOT NULL,
+		size INTEGER NOT NULL,
+		received_at INTEGER NOT NULL,
+		PRIMARY KEY (upload_id, chunk_index)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_upload_chunks_upload_id ON upload_chunks(upload_id)`,
 }
+
+// uploadRequestIDIndex enforces init idempotency on (environment_id,
+// request_id) for sessions that carry a client requestId. Partial index so
+// legacy rows without a key never conflict (SQLite partial indexes supported).
+const uploadRequestIDIndex = `CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_sessions_env_request
+	ON upload_sessions(environment_id, request_id) WHERE request_id IS NOT NULL`
 
 // clipColumns keeps SELECT * behaviour stable across schema migrations.
 const clipColumns = `id, type, created_at, expires_at, max_downloads, download_count,
@@ -158,10 +192,43 @@ func (r *ClipRepository) ensureSchema() error {
 			return fmt.Errorf("unable to initialize schema: %w", err)
 		}
 	}
-	rows, err := r.db.Query("PRAGMA table_info(clips)")
+	columns, err := r.tableColumns("clips")
 	if err != nil {
-		return fmt.Errorf("unable to inspect schema: %w", err)
+		return err
 	}
+	if !columns["owner_id"] {
+		if _, err := r.db.Exec("ALTER TABLE clips ADD COLUMN owner_id TEXT DEFAULT ''"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+		if _, err := r.db.Exec("UPDATE clips SET owner_id = '' WHERE owner_id IS NULL"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	// upload_sessions.request_id: add column for databases created before
+	// chunked-upload idempotency existed, then build the partial UNIQUE index.
+	uploadColumns, err := r.tableColumns("upload_sessions")
+	if err != nil {
+		return err
+	}
+	if !uploadColumns["request_id"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN request_id TEXT"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+		// De-dup guard: legacy rows carry NULL, which the partial index ignores.
+	}
+	if _, err := r.db.Exec(uploadRequestIDIndex); err != nil {
+		return fmt.Errorf("unable to migrate schema: %w", err)
+	}
+	return nil
+}
+
+// tableColumns returns the column-name set of a table.
+func (r *ClipRepository) tableColumns(table string) (map[string]bool, error) {
+	rows, err := r.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, fmt.Errorf("unable to inspect schema: %w", err)
+	}
+	defer rows.Close()
 	columns := make(map[string]bool)
 	for rows.Next() {
 		var (
@@ -173,24 +240,14 @@ func (r *ClipRepository) ensureSchema() error {
 			pk       int
 		)
 		if err := rows.Scan(&cid, &name, &declType, &notNull, &dflt, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("unable to inspect schema: %w", err)
+			return nil, fmt.Errorf("unable to inspect schema: %w", err)
 		}
 		columns[name] = true
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("unable to inspect schema: %w", err)
+		return nil, fmt.Errorf("unable to inspect schema: %w", err)
 	}
-	if !columns["owner_id"] {
-		if _, err := r.db.Exec("ALTER TABLE clips ADD COLUMN owner_id TEXT DEFAULT ''"); err != nil {
-			return fmt.Errorf("unable to migrate schema: %w", err)
-		}
-		if _, err := r.db.Exec("UPDATE clips SET owner_id = '' WHERE owner_id IS NULL"); err != nil {
-			return fmt.Errorf("unable to migrate schema: %w", err)
-		}
-	}
-	return nil
+	return columns, nil
 }
 
 func (r *ClipRepository) tokenTTLSeconds() int64 {
