@@ -13,6 +13,13 @@ Go 1.23 (net/http + modernc.org/sqlite + google/uuid，纯标准库路由，无 
 
 ---
 
+## 开发协作指南（给 AI Agent / 新贡献者）
+
+- 中文：[`AGENT.md`](./agent.md)
+- English: [`AGENT_EN.md`](./AGENT_EN.md)
+
+> 建议在做任何跨层或行为变更前先阅读该指南，避免破坏 API/数据兼容性。
+
 ## 1. 文件对应关系
 
 | Python 源文件 | Go 文件 | 说明 |

@@ -632,6 +632,78 @@ func (r *ClipRepository) ListClips(environmentID string) ([]*models.Clip, error)
 	return clips, rows.Err()
 }
 
+// AdminEnvironmentSummary describes clip counts grouped by owner_id.
+type AdminEnvironmentSummary struct {
+	EnvironmentID string
+	ClipCount     int64
+	ActiveCount   int64
+}
+
+// ListEnvironmentsAdmin returns all known environments with clip counts.
+func (r *ClipRepository) ListEnvironmentsAdmin() ([]AdminEnvironmentSummary, error) {
+	now := nowUnix()
+	rows, err := r.db.Query(`SELECT owner_id, COUNT(1) AS clip_count,
+		SUM(CASE WHEN expires_at > ? AND download_count < max_downloads THEN 1 ELSE 0 END) AS active_count
+		FROM clips GROUP BY owner_id ORDER BY owner_id ASC`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AdminEnvironmentSummary, 0)
+	for rows.Next() {
+		var item AdminEnvironmentSummary
+		if err := rows.Scan(&item.EnvironmentID, &item.ClipCount, &item.ActiveCount); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ListClipsAdmin returns clips across all owners (or one owner) with pagination.
+func (r *ClipRepository) ListClipsAdmin(environmentID string, limit int, offset int) ([]*models.Clip, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	where := ""
+	args := make([]interface{}, 0, 3)
+	countArgs := make([]interface{}, 0, 1)
+	if env := strings.TrimSpace(environmentID); env != "" {
+		where = " WHERE owner_id = ?"
+		args = append(args, env)
+		countArgs = append(countArgs, env)
+	}
+	var total int64
+	if err := r.db.QueryRow("SELECT COUNT(1) FROM clips"+where, countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	args = append(args, limit, offset)
+	rows, err := r.db.Query("SELECT "+clipColumns+" FROM clips"+where+" ORDER BY created_at DESC LIMIT ? OFFSET ?", args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	items := make([]*models.Clip, 0, limit)
+	for rows.Next() {
+		clip, err := scanClip(rows.Scan)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, clip)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
 func (r *ClipRepository) queryClip(query string, args ...interface{}) (*models.Clip, error) {
 	clip, err := scanClip(r.db.QueryRow(query, args...).Scan)
 	if err != nil {

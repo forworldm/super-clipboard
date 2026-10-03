@@ -87,6 +87,12 @@ func NewApp(settings *config.Settings, repo *repository.ClipRepository) *App {
 	app.router.add("/api/uploads/{id}/complete", []string{http.MethodPost}, app.handleCompleteUpload)
 	app.router.add("/api/uploads/{id}", []string{http.MethodDelete}, app.handleAbortUpload)
 
+	// Admin endpoints (strict bearer auth).
+	app.router.add("/api/admin/environments", []string{http.MethodGet}, app.handleAdminListEnvironments)
+	app.router.add("/api/admin/clips", []string{http.MethodGet}, app.handleAdminListClips)
+	app.router.add("/api/admin/clips/{clip_id}", []string{http.MethodGet}, app.handleAdminGetClip)
+	app.router.add("/api/admin/clips/{clip_id}", []string{http.MethodDelete}, app.handleAdminDeleteClip)
+
 	app.router.add("/{access_code}/raw", []string{http.MethodGet}, app.handleResolveRaw)
 	app.router.add("/{access_code}", []string{http.MethodGet}, app.handleResolve)
 

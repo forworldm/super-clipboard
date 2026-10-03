@@ -37,6 +37,8 @@ type Settings struct {
 	CaptchaTimeoutSeconds  float64
 	CaptchaBypassToken     string
 	CaptchaSiteKey         string
+	// Admin API auth key (empty means disabled).
+	AdminAPIKey string
 	// Chunked upload settings (server-generated, never trust client values).
 	UploadChunkSizeBytes    int
 	UploadSessionTTLSeconds int
@@ -83,10 +85,10 @@ func Defaults() *Settings {
 // MinUploadChunkSizeBytes / MaxUploadChunkSizeBytes bound the server-generated
 // chunk size so a misconfigured env cannot produce absurd sessions.
 const (
-	MinUploadChunkSizeBytes = 64 << 10       // 64 KiB
-	MaxUploadChunkSizeBytes = 8 << 20        // 8 MiB
-	MinUploadTTLSeconds     = 60             // 1 minute (tests use small TTLs)
-	MaxUploadTTLSeconds     = 7 * 24 * 3600  // 7 days
+	MinUploadChunkSizeBytes = 64 << 10      // 64 KiB
+	MaxUploadChunkSizeBytes = 8 << 20       // 8 MiB
+	MinUploadTTLSeconds     = 60            // 1 minute (tests use small TTLs)
+	MaxUploadTTLSeconds     = 7 * 24 * 3600 // 7 days
 )
 
 // EffectiveChunkSize returns a sane chunk size even if Settings was built
@@ -206,6 +208,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 	str("FILE_STORAGE_DIR", &s.FileStorageDir)
 	str("APP_HOST", &s.AppHost)
 	str("STATIC_ROOT", &s.StaticRoot)
+	str("ADMIN_API_KEY", &s.AdminAPIKey)
 
 	intVar := func(name string, target *int) error {
 		value, ok := lookup(name)
@@ -312,6 +315,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 	s.CaptchaSecret = trimmed("CAPTCHA_SECRET")
 	s.CaptchaBypassToken = trimmed("CAPTCHA_BYPASS_TOKEN")
 	s.CaptchaSiteKey = trimmed("CAPTCHA_SITE_KEY")
+	s.AdminAPIKey = strings.TrimSpace(s.AdminAPIKey)
 
 	// Module import side effects: mkdir(parents=True, exist_ok=True)
 	if err := os.MkdirAll(s.FileStorageDir, 0o755); err != nil {
