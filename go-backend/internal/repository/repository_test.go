@@ -2,6 +2,7 @@ package repository
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -462,6 +463,40 @@ func TestTokenLifecycle(t *testing.T) {
 	}
 	if reassigned.LastUsedAt != nil {
 		t.Fatalf("lastUsedAt should be reset")
+	}
+
+	// The original owner of an expired token keeps the binding.
+	if _, err := repo.db.Exec(
+		"INSERT INTO tokens (token, owner_id, updated_at, last_used_at, expires_at) VALUES (?, ?, ?, NULL, ?)",
+		"keep-owner", "same-owner", time.Now().Add(-2*time.Hour).Unix(), time.Now().Add(-time.Hour).Unix(),
+	); err != nil {
+		t.Fatalf("unable to seed same-owner token: %v", err)
+	}
+	same := "same-owner"
+	kept, err := repo.RegisterToken("keep-owner", &same)
+	if err != nil {
+		t.Fatalf("unable to refresh expired token for the same owner: %v", err)
+	}
+	if kept.EnvironmentID != "same-owner" {
+		t.Fatalf("same owner should be preserved, got %s", kept.EnvironmentID)
+	}
+}
+
+// TestUniqueConstraintOn covers the SQLite UNIQUE error matcher used as a
+// race fallback next to the explicit existence checks.
+func TestUniqueConstraintOn(t *testing.T) {
+	err := errors.New("constraint failed: UNIQUE constraint failed: clips.access_code (2067)")
+	if !uniqueConstraintOn(err, "clips.access_code") {
+		t.Fatalf("expected a match for clips.access_code")
+	}
+	if uniqueConstraintOn(err, "tokens.token") {
+		t.Fatalf("column should not match tokens.token")
+	}
+	if uniqueConstraintOn(nil, "clips.access_code") {
+		t.Fatalf("nil error should not match")
+	}
+	if uniqueConstraintOn(errors.New("disk I/O error"), "clips.access_code") {
+		t.Fatalf("unrelated error should not match")
 	}
 }
 

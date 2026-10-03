@@ -276,8 +276,12 @@ func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*To
 			"INSERT INTO tokens (token, owner_id, updated_at, last_used_at, expires_at) VALUES (?, ?, ?, NULL, ?)",
 			trimmed, assignedOwner, now, expiresAt,
 		); execErr != nil {
+			if uniqueConstraintOn(execErr, "tokens.token") {
+				return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+			}
 			return nil, execErr
 		}
+
 		lastUsedAt = nil
 	default:
 		return nil, err
@@ -505,6 +509,9 @@ func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, erro
 		fileSize,
 		fileMime,
 	); err != nil {
+		if uniqueConstraintOn(err, "clips.access_code") {
+			return nil, &apperr.ValueError{Message: "直链码已存在，请刷新后再试"}
+		}
 		return nil, err
 	}
 
@@ -672,41 +679,31 @@ func (r *ClipRepository) PurgeInactive() (int, error) {
 	now := nowUnix()
 
 	r.mu.Lock()
-	rows, err := r.db.Query(
-		"SELECT id, file_path FROM clips WHERE expires_at <= ? OR download_count >= max_downloads",
-		now,
-	)
+	victims, err := r.collectInactive(now)
 	if err != nil {
 		r.mu.Unlock()
 		return 0, err
 	}
-	type pending struct {
-		id       string
-		filePath string
+	if len(victims) == 0 {
+		r.mu.Unlock()
+		return 0, nil
 	}
-	var victims []pending
-	for rows.Next() {
-		var (
-			id       string
-			filePath sql.NullString
-		)
-		if err := rows.Scan(&id, &filePath); err != nil {
-			rows.Close()
-			r.mu.Unlock()
-			return 0, err
-		}
-		victims = append(victims, pending{id: id, filePath: filePath.String})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+
+	tx, err := r.db.Begin()
+	if err != nil {
 		r.mu.Unlock()
 		return 0, err
 	}
 	for _, victim := range victims {
-		if _, err := r.db.Exec("DELETE FROM clips WHERE id = ?", victim.id); err != nil {
+		if _, err := tx.Exec("DELETE FROM clips WHERE id = ?", victim.id); err != nil {
+			_ = tx.Rollback()
 			r.mu.Unlock()
 			return 0, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		r.mu.Unlock()
+		return 0, err
 	}
 	r.mu.Unlock()
 
@@ -716,4 +713,47 @@ func (r *ClipRepository) PurgeInactive() (int, error) {
 		}
 	}
 	return len(victims), nil
+}
+
+type pendingPurge struct {
+	id       string
+	filePath string
+}
+
+func (r *ClipRepository) collectInactive(now int64) ([]pendingPurge, error) {
+	rows, err := r.db.Query(
+		"SELECT id, file_path FROM clips WHERE expires_at <= ? OR download_count >= max_downloads",
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var victims []pendingPurge
+	for rows.Next() {
+		var (
+			id       string
+			filePath sql.NullString
+		)
+		if err := rows.Scan(&id, &filePath); err != nil {
+			return nil, err
+		}
+		victims = append(victims, pendingPurge{id: id, filePath: filePath.String})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return victims, nil
+}
+
+// uniqueConstraintOn reports whether err is a SQLite UNIQUE failure on tableColumn
+// (for example "clips.access_code"). Used as a race fallback next to the
+// explicit pre-insert existence check.
+func uniqueConstraintOn(err error, tableColumn string) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") && strings.Contains(msg, tableColumn)
 }

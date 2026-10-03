@@ -129,6 +129,21 @@ func TestStoreDataURL(t *testing.T) {
 		t.Fatalf("expected a guessed .png suffix, got %q", anonymous.Path)
 	}
 
+	// Path separators in the original filename must not escape the storage dir.
+	escaped, err := StoreDataURL(dir, "../../evil.txt", "data:text/plain;base64,"+base64.StdEncoding.EncodeToString([]byte("x")))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filepath.Dir(escaped.Path) != dir {
+		t.Fatalf("stored path escaped the dir: %s", escaped.Path)
+	}
+	if !strings.HasSuffix(escaped.Path, ".txt") {
+		t.Fatalf("expected .txt suffix, got %q", escaped.Path)
+	}
+	if escaped.Name != "../../evil.txt" {
+		t.Fatalf("display name should be preserved, got %q", escaped.Name)
+	}
+
 	// A broken payload raises the ValueError equivalent.
 	if _, err := StoreDataURL(dir, "broken.txt", "not-a-data-url"); err == nil {
 		t.Fatalf("expected an error")

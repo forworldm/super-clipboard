@@ -19,15 +19,26 @@ import (
 )
 
 // maxBodyBytes caps request bodies (a 50MB upload becomes ~67MB of base64).
-const maxBodyBytes = 512 << 20
+// The value is a var so tests can lower it without allocating a 512MiB payload.
+var maxBodyBytes int64 = 512 << 20
 
 // readBody consumes the request body like FastAPI does before validation.
+// Bodies larger than maxBodyBytes yield 413 instead of a truncated JSON parse.
 func readBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
 	defer r.Body.Close()
-	return io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	limited := http.MaxBytesReader(nil, r.Body, maxBodyBytes)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return nil, newHTTPError(http.StatusRequestEntityTooLarge, "请求体过大")
+		}
+		return nil, err
+	}
+	return data, nil
 }
 
 // requiredQuery mirrors a mandatory FastAPI query parameter such as
@@ -374,8 +385,10 @@ func (a *App) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := writeFileResponse(w, r, filePath, mediaType, fileName); err != nil {
 		a.logger.Printf("ERROR:    unable to stream %s: %v", filePath, err)
+		writeError(w, newHTTPError(http.StatusGone, "文件已丢失"))
 		return
 	}
+
 	if reached {
 		// background.add_task(repository.delete_clip, ...)
 		go func() {
@@ -543,8 +556,10 @@ func (a *App) dispatchClipResponse(w http.ResponseWriter, r *http.Request, clip 
 		}
 		if err := writeFileResponse(w, r, filePath, clip.StoredFile.Mime, clip.StoredFile.Name); err != nil {
 			a.logger.Printf("ERROR:    unable to stream %s: %v", filePath, err)
+			writeError(w, newHTTPError(http.StatusGone, "文件已丢失"))
 			return
 		}
+
 		if reached {
 			a.scheduleDelete(clip.ID, clip.EnvironmentID)
 		}

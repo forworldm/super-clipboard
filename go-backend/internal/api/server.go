@@ -135,16 +135,12 @@ func staticMiddleware(mounts []staticMount, next http.Handler) http.Handler {
 
 func serveStaticFile(w http.ResponseWriter, r *http.Request, mount staticMount, requestPath string) {
 	remainder := strings.TrimPrefix(requestPath, mount.prefix)
-	if strings.Contains(remainder, "..") {
-		writePlainText(w, http.StatusNotFound, "Not Found")
-		return
-	}
 	root, err := filepath.Abs(mount.dir)
 	if err != nil {
 		root = mount.dir
 	}
-	target := filepath.Join(root, filepath.FromSlash(path.Clean("/"+remainder)))
-	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+	target, ok := safeJoinRoot(root, remainder)
+	if !ok {
 		writePlainText(w, http.StatusNotFound, "Not Found")
 		return
 	}
@@ -173,6 +169,44 @@ func serveStaticFile(w http.ResponseWriter, r *http.Request, mount staticMount, 
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }
 
+// safeJoinRoot maps a URL remainder onto a file under root. The remainder is
+// cleaned as a URL path (so ".." cannot walk out of the mount) and the final
+// filesystem path is checked with filepath.Rel as defense in depth.
+//
+// Unlike a naive strings.Contains(remainder, "..") check this allows legitimate
+// names such as "vendor..chunk.js".
+func safeJoinRoot(root, remainder string) (string, bool) {
+	remainder = strings.TrimPrefix(remainder, "/")
+	if remainder == "" || strings.ContainsRune(remainder, 0) {
+		return "", false
+	}
+	cleaned := path.Clean("/" + remainder)
+	if cleaned == "/" || cleaned == "." {
+		return "", false
+	}
+	relative := strings.TrimPrefix(cleaned, "/")
+	if relative == "" {
+		return "", false
+	}
+	target := filepath.Join(root, filepath.FromSlash(relative))
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		absRoot = root
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(absRoot, absTarget)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return absTarget, true
+}
+
 // Run reproduces the uvicorn entrypoint: startup purge, periodic cleanup worker
 // (asyncio.create_task in main.py) and graceful shutdown on SIGINT/SIGTERM.
 func (a *App) Run() error {
@@ -199,6 +233,8 @@ func (a *App) RunWithContext(ctx context.Context) error {
 		Addr:              address,
 		Handler:           a.Handler(),
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	errChan := make(chan error, 1)

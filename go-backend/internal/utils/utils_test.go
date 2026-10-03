@@ -67,6 +67,13 @@ func TestBuildBaseURL(t *testing.T) {
 	if got := BuildBaseURL(request); got != "http://clip.example.com:8080" {
 		t.Fatalf("the host header port should be preserved, got %q", got)
 	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://example.com/54321", nil)
+	request.Header.Set("X-Forwarded-Proto", "https, http")
+	request.Header.Set("X-Forwarded-Host", "clips.example.net, inner")
+	if got := BuildBaseURL(request); got != "https://clips.example.net" {
+		t.Fatalf("forwarded proto+host should win, got %q", got)
+	}
 }
 
 // TestExtractClientIP mirrors _extract_client_ip.
@@ -90,12 +97,12 @@ func TestExtractClientIP(t *testing.T) {
 
 // TestIsPrivateAddress mirrors the proxy guard in create_clip.
 func TestIsPrivateAddress(t *testing.T) {
-	for _, address := range []string{"127.0.0.1", "10.1.2.3", "192.168.0.10", "172.17.0.2"} {
+	for _, address := range []string{"127.0.0.1", "10.1.2.3", "192.168.0.10", "172.17.0.2", "172.15.0.1"} {
 		if !IsPrivateAddress(address) {
 			t.Fatalf("%s should be treated as private", address)
 		}
 	}
-	for _, address := range []string{"", "8.8.8.8", "203.0.113.9"} {
+	for _, address := range []string{"", "8.8.8.8", "203.0.113.9", "11.0.0.1"} {
 		if IsPrivateAddress(address) {
 			t.Fatalf("%s should not be treated as private", address)
 		}

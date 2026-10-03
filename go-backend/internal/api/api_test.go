@@ -729,6 +729,7 @@ func TestCorsBehaviour(t *testing.T) {
 	preflight := httptest.NewRequest(http.MethodOptions, "/api/clips", nil)
 	preflight.Header.Set("Origin", "https://clip.example.com")
 	preflight.Header.Set("Access-Control-Request-Method", "POST")
+	preflight.Header.Set("Access-Control-Request-Headers", "content-type")
 	preflightRecorder := httptest.NewRecorder()
 	app.Handler().ServeHTTP(preflightRecorder, preflight)
 	requireStatus(t, preflightRecorder, http.StatusOK)
@@ -738,6 +739,16 @@ func TestCorsBehaviour(t *testing.T) {
 	if preflightRecorder.Header().Get("Access-Control-Max-Age") != "600" {
 		t.Fatalf("preflight missing max age")
 	}
+	if allowMethods := preflightRecorder.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(allowMethods, http.MethodPost) {
+		t.Fatalf("preflight missing allow methods, got %q", allowMethods)
+	}
+	if preflightRecorder.Header().Get("Access-Control-Allow-Headers") != "content-type" {
+		t.Fatalf("preflight should echo requested headers, got %q", preflightRecorder.Header().Get("Access-Control-Allow-Headers"))
+	}
+	if preflightRecorder.Body.String() != "OK" {
+		t.Fatalf("preflight body should be OK, got %q", preflightRecorder.Body.String())
+	}
+
 }
 
 // TestFileSizeLimit covers the max_file_size_bytes guard.

@@ -119,14 +119,17 @@ func StoreDataURL(dir string, filename string, dataURL string) (*models.StoredFi
 	}
 
 	safeName := filename
-	if safeName == "" {
+	if strings.TrimSpace(safeName) == "" {
 		safeName = "uploaded"
 	}
 
 	now := time.Now().UTC()
 	timestamp := fmt.Sprintf("%s%06d", now.Format("20060102150405"), now.Nanosecond()/1000)
 
-	suffix := filepath.Ext(safeName)
+	// Only the last path element contributes to the on-disk suffix so a crafted
+	// filename cannot inject separators. The original name is kept as metadata.
+	base := filepath.Base(strings.ReplaceAll(safeName, "\\", "/"))
+	suffix := filepath.Ext(base)
 	guessedSuffix := GuessExtension(mime)
 	finalSuffix := suffix
 	if finalSuffix == "" {

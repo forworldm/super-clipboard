@@ -50,19 +50,23 @@ func BuildTextClipHTML(content string, createdAt time.Time, downloadCount int, c
 
 // BuildBaseURL mirrors build_base_url: `str(request.base_url).rstrip("/")`,
 // i.e. "<scheme>://<host header>" without a trailing slash.
+//
+// uvicorn enables proxy_headers by default, so X-Forwarded-Proto and
+// X-Forwarded-Host take precedence when present (first comma-separated value).
 func BuildBaseURL(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
-		if candidate := strings.TrimSpace(strings.Split(forwarded, ",")[0]); candidate != "" {
-			scheme = candidate
-		}
+	if forwarded := firstHeaderValue(r.Header, "X-Forwarded-Proto"); forwarded != "" {
+		scheme = forwarded
 	}
 	host := r.Host
 	if host == "" {
 		host = r.URL.Host
+	}
+	if forwardedHost := firstHeaderValue(r.Header, "X-Forwarded-Host"); forwardedHost != "" {
+		host = forwardedHost
 	}
 	if host == "" {
 		host = "localhost"
@@ -70,14 +74,20 @@ func BuildBaseURL(r *http.Request) string {
 	return strings.TrimRight(scheme+"://"+host, "/")
 }
 
+// firstHeaderValue returns the first comma-separated entry of a header.
+func firstHeaderValue(header http.Header, key string) string {
+	raw := header.Get(key)
+	if raw == "" {
+		return ""
+	}
+	return strings.TrimSpace(strings.Split(raw, ",")[0])
+}
+
 // ExtractClientIP mirrors _extract_client_ip: first X-Forwarded-For entry, else
 // the peer address of the connection.
 func ExtractClientIP(r *http.Request) string {
-	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-		candidate := strings.TrimSpace(strings.Split(forwardedFor, ",")[0])
-		if candidate != "" {
-			return candidate
-		}
+	if forwarded := firstHeaderValue(r.Header, "X-Forwarded-For"); forwarded != "" {
+		return forwarded
 	}
 	if r.RemoteAddr != "" {
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -90,6 +100,10 @@ func ExtractClientIP(r *http.Request) string {
 
 // IsPrivateAddress reproduces the `client_ip.startswith(("127.", "10.", "192.168.", "172."))`
 // guard used before forwarding the IP to the captcha provider.
+//
+// The "172." prefix is intentionally broader than RFC 1918 (which is only
+// 172.16/12): the Python backend uses startswith, and matching it keeps
+// captcha remoteip behaviour identical.
 func IsPrivateAddress(ip string) bool {
 	if ip == "" {
 		return false
