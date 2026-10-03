@@ -169,6 +169,30 @@ func (a *App) resolveFile(request *schemas.ClipCreateRequest) (*models.StoredFil
 	return storedFile, nil
 }
 
+func (a *App) ensureAccessTokenOwner(token string, environmentID string) error {
+	if _, err := a.Repo.EnsureTokenOwner(token, environmentID); err != nil {
+		if apperr.IsValueCode(err, apperr.CodeTokenNotRegistered) {
+			if _, registerErr := a.Repo.RegisterToken(token, &environmentID); registerErr != nil {
+				if apperr.IsValueCode(registerErr, apperr.CodeTokenOccupied) {
+					var valueErr *apperr.ValueError
+					if errors.As(registerErr, &valueErr) && valueErr != nil {
+						return newHTTPError(http.StatusConflict, valueErr.Message)
+					}
+					return newHTTPError(http.StatusConflict, "持久 Token 已被其他设备占用，请稍后重试")
+				}
+				return registerErr
+			}
+			return nil
+		}
+		var valueErr *apperr.ValueError
+		if errors.As(err, &valueErr) {
+			return newHTTPError(http.StatusConflict, valueErr.Message)
+		}
+		return err
+	}
+	return nil
+}
+
 func (a *App) handleCreateClip(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
@@ -194,24 +218,9 @@ func (a *App) handleCreateClip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if request.HasAccessToken() {
-		if _, err := a.Repo.EnsureTokenOwner(*request.AccessToken, environmentID); err != nil {
-			var valueError *apperr.ValueError
-			if !errors.As(err, &valueError) {
-				writeError(w, err)
-				return
-			}
-			message := valueError.Message
-			if strings.Contains(message, "未注册") || strings.Contains(message, "未找到") {
-				if _, registerErr := a.Repo.RegisterToken(*request.AccessToken, &environmentID); registerErr != nil {
-					// Python lets this ValueError escape -> 500 Internal Server Error.
-					a.logger.Printf("ERROR:    unable to register token: %v", registerErr)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-					return
-				}
-			} else {
-				writeError(w, newHTTPError(http.StatusConflict, message))
-				return
-			}
+		if err := a.ensureAccessTokenOwner(*request.AccessToken, environmentID); err != nil {
+			writeError(w, err)
+			return
 		}
 	}
 
@@ -247,7 +256,7 @@ func (a *App) handleCreateClip(w http.ResponseWriter, r *http.Request) {
 		var valueError *apperr.ValueError
 		if errors.As(err, &valueError) {
 			status := http.StatusBadRequest
-			if strings.Contains(valueError.Message, "已存在") || strings.Contains(valueError.Message, "Token") {
+			if valueError.Code == apperr.CodeAccessCodeConflict || valueError.Code == apperr.CodeTokenOccupied {
 				status = http.StatusConflict
 			}
 			writeError(w, newHTTPError(status, valueError.Message))

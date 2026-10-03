@@ -14,7 +14,7 @@
 //   - Crash recovery: COMPLETE flips active->completing (recording the staged
 //     path) before any assembly IO. If the server dies mid-assembly the row
 //     stays in `completing` and startup reconciliation (ResetStuckCompleting
-//     + orphan sweeps) rolls it back to `active`.
+//   - orphan sweeps) rolls it back to `active`.
 package repository
 
 import (
@@ -34,6 +34,11 @@ const (
 	UploadStatusCompleted  = "completed"
 )
 
+var (
+	ErrUploadAlreadyCompleted = errors.New("upload already completed")
+	ErrChunkIndexOutOfRange   = errors.New("chunk index out of range")
+)
+
 // UploadSession mirrors one row of upload_sessions.
 type UploadSession struct {
 	ID            string
@@ -45,9 +50,9 @@ type UploadSession struct {
 	Status        string
 	EnvironmentID string
 	RequestID     string // client idempotency key (empty for legacy sessions)
-	CreatedAt     int64 // unix seconds
-	UpdatedAt     int64 // unix seconds
-	ExpiresAt     int64 // unix seconds
+	CreatedAt     int64  // unix seconds
+	UpdatedAt     int64  // unix seconds
+	ExpiresAt     int64  // unix seconds
 	StagedPath    string // final assembled file (set when completing/completed)
 	ClipID        string // clip created by complete (empty for file-only sessions)
 	// QuotaReleased reports whether this session already returned its upload
@@ -231,6 +236,7 @@ func (r *ClipRepository) GetUploadSessionByRequestID(environmentID string, reque
 //   - a live session for the key is returned with created=false (replay);
 //   - an expired session for the key is purged and replaced with a fresh one;
 //   - without a requestID this always creates (no dedup possible).
+//
 // Two parallel inits race on the partial UNIQUE index: the loser re-reads the
 // winner's row and returns it, so exactly one session consumes the key.
 func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionParams) (session *UploadSession, created bool, err error) {
@@ -366,10 +372,10 @@ func (r *ClipRepository) MarkChunkReceived(uploadID string, index int, size int6
 		return err
 	}
 	if status == UploadStatusCompleted {
-		return errors.New("upload already completed")
+		return ErrUploadAlreadyCompleted
 	}
 	if index >= total {
-		return errors.New("chunk index out of range")
+		return ErrChunkIndexOutOfRange
 	}
 	if _, err := tx.Exec(`INSERT INTO upload_chunks (upload_id, chunk_index, size, received_at)
 		VALUES (?, ?, ?, ?)

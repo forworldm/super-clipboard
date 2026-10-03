@@ -454,7 +454,7 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Session completed concurrently: chunk file is now orphan; best-effort remove.
-		if strings.Contains(err.Error(), "already completed") {
+		if errors.Is(err, repository.ErrUploadAlreadyCompleted) {
 			_ = os.Remove(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, index))
 			writeError(w, newHTTPError(http.StatusConflict, "上传已完成"))
 			return
@@ -654,11 +654,6 @@ func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.logger.Printf("ERROR:    unable to assemble upload %s: %v", uploadID, err)
-		// Disk-loss of a single chunk file surfaces as "missing chunk N".
-		if strings.HasPrefix(err.Error(), "missing chunk ") {
-			writeError(w, newHTTPError(http.StatusBadRequest, "分片缺失，请续传后重试"))
-			return
-		}
 		writeError(w, newHTTPError(http.StatusInternalServerError, "文件合并失败，请重试"))
 		return
 	}
@@ -791,7 +786,8 @@ func (a *App) assembleSessionFiles(session *repository.UploadSession, completing
 	}
 	if err := storage.AssembleChunks(a.Settings.FileStorageDir, session.ID, session.TotalChunks, staged, session.FileSize); err != nil {
 		// Translate a mid-assembly disappearance into a resume hint.
-		if strings.HasPrefix(err.Error(), "missing chunk ") {
+		var missingChunk *storage.MissingChunkError
+		if errors.As(err, &missingChunk) {
 			// Re-scan to build the accurate missing set.
 			missing = missing[:0]
 			for i := 0; i < session.TotalChunks; i++ {
@@ -828,23 +824,9 @@ func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, se
 		return false
 	}
 	if params.AccessToken != nil && *params.AccessToken != "" {
-		if _, err := a.Repo.EnsureTokenOwner(*params.AccessToken, envID); err != nil {
-			var valueError *apperr.ValueError
-			if !errors.As(err, &valueError) {
-				writeError(w, err)
-				return false
-			}
-			message := valueError.Message
-			if strings.Contains(message, "未注册") || strings.Contains(message, "未找到") {
-				if _, registerErr := a.Repo.RegisterToken(*params.AccessToken, &envID); registerErr != nil {
-					a.logger.Printf("ERROR:    unable to register token: %v", registerErr)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-					return false
-				}
-			} else {
-				writeError(w, newHTTPError(http.StatusConflict, message))
-				return false
-			}
+		if err := a.ensureAccessTokenOwner(*params.AccessToken, envID); err != nil {
+			writeError(w, err)
+			return false
 		}
 	}
 	return true
@@ -875,7 +857,7 @@ func (a *App) writeClipCreationError(w http.ResponseWriter, err error) {
 	var valueError *apperr.ValueError
 	if errors.As(err, &valueError) {
 		status := http.StatusBadRequest
-		if strings.Contains(valueError.Message, "已存在") || strings.Contains(valueError.Message, "Token") {
+		if valueError.Code == apperr.CodeAccessCodeConflict || valueError.Code == apperr.CodeTokenOccupied {
 			status = http.StatusConflict
 		}
 		writeError(w, newHTTPError(status, valueError.Message))

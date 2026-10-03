@@ -58,6 +58,26 @@ func EnsureUploadDir(baseDir, uploadID string) error {
 // buffering the whole body in memory.
 var ErrChunkTooLarge = errors.New("chunk too large")
 
+// MissingChunkError reports which chunk index is missing during assembly.
+type MissingChunkError struct {
+	Index int
+	Err   error
+}
+
+func (e *MissingChunkError) Error() string {
+	if e == nil {
+		return "missing chunk"
+	}
+	return fmt.Sprintf("missing chunk %d", e.Index)
+}
+
+func (e *MissingChunkError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func WriteChunkStream(baseDir, uploadID string, index int, r io.Reader, limit int64) (int64, error) {
 	if index < 0 {
 		return 0, errors.New("invalid chunk index")
@@ -133,7 +153,7 @@ func AssembleChunks(baseDir, uploadID string, totalChunks int, destPath string, 
 		chunkPath := ChunkFilePath(baseDir, uploadID, i)
 		in, err := os.Open(chunkPath)
 		if err != nil {
-			return fmt.Errorf("missing chunk %d: %w", i, err)
+			return &MissingChunkError{Index: i, Err: err}
 		}
 		n, err := io.CopyBuffer(out, in, buf)
 		closeErr := in.Close()

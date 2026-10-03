@@ -293,7 +293,7 @@ func nowUnix() int64 { return time.Now().UTC().Unix() }
 func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*TokenRecord, error) {
 	trimmed := strings.TrimSpace(token)
 	if trimmed == "" {
-		return nil, &apperr.ValueError{Message: "持久 Token 无效"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeTokenInvalid, "持久 Token 无效")
 	}
 	now := nowUnix()
 	ttl := r.tokenTTLSeconds()
@@ -349,7 +349,7 @@ func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*To
 					lastUsedAt = &value
 				}
 			} else {
-				return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+				return nil, apperr.NewValueErrorCode(apperr.CodeTokenOccupied, "持久 Token 已被其他设备占用，请稍后重试")
 			}
 		}
 	case errors.Is(err, sql.ErrNoRows):
@@ -363,7 +363,7 @@ func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*To
 			trimmed, assignedOwner, now, expiresAt,
 		); execErr != nil {
 			if uniqueConstraintOn(execErr, "tokens.token") {
-				return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+				return nil, apperr.NewValueErrorCode(apperr.CodeTokenOccupied, "持久 Token 已被其他设备占用，请稍后重试")
 			}
 			return nil, execErr
 		}
@@ -389,11 +389,11 @@ func (r *ClipRepository) RegisterToken(token string, environmentID *string) (*To
 func (r *ClipRepository) EnsureTokenOwner(token string, environmentID string) (*TokenRecord, error) {
 	trimmed := strings.TrimSpace(token)
 	if trimmed == "" {
-		return nil, &apperr.ValueError{Message: "持久 Token 无效"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeTokenInvalid, "持久 Token 无效")
 	}
 	normalizedEnv := strings.TrimSpace(environmentID)
 	if normalizedEnv == "" {
-		return nil, &apperr.ValueError{Message: "Token 校验失败"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeTokenVerifyFailed, "Token 校验失败")
 	}
 	now := nowUnix()
 	ttl := r.tokenTTLSeconds()
@@ -417,7 +417,7 @@ func (r *ClipRepository) EnsureTokenOwner(token string, environmentID string) (*
 	row := tx.QueryRow("SELECT owner_id, updated_at, last_used_at, expires_at FROM tokens WHERE token = ?", trimmed)
 	if err := row.Scan(&ownerID, &updatedAt, &lastUsed, &rowExpiry); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &apperr.ValueError{Message: "持久 Token 未注册，请重新保存"}
+			return nil, apperr.NewValueErrorCode(apperr.CodeTokenNotRegistered, "持久 Token 未注册，请重新保存")
 		}
 		return nil, err
 	}
@@ -428,10 +428,10 @@ func (r *ClipRepository) EnsureTokenOwner(token string, environmentID string) (*
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		return nil, &apperr.ValueError{Message: "持久 Token 已过期，请重新生成"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeTokenExpired, "持久 Token 已过期，请重新生成")
 	}
 	if ownerID != normalizedEnv {
-		return nil, &apperr.ValueError{Message: "持久 Token 已被其他设备占用，请稍后重试"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeTokenOccupied, "持久 Token 已被其他设备占用，请稍后重试")
 	}
 	if _, err := tx.Exec(
 		"UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE token = ?",
@@ -536,11 +536,11 @@ type CreateClipParams struct {
 func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, error) {
 	expiresAt := time.UnixMilli(params.ExpiresAtMs).UTC()
 	if !expiresAt.After(time.Now().UTC()) {
-		return nil, &apperr.ValueError{Message: "过期时间必须晚于当前时间"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeInvalidExpiresAt, "过期时间必须晚于当前时间")
 	}
 	environmentID := strings.TrimSpace(params.EnvironmentID)
 	if environmentID == "" {
-		return nil, &apperr.ValueError{Message: "剪贴板所属标识缺失"}
+		return nil, apperr.NewValueErrorCode(apperr.CodeMissingEnvironment, "剪贴板所属标识缺失")
 	}
 
 	r.mu.Lock()
@@ -557,7 +557,7 @@ func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, erro
 		err := tx.QueryRow("SELECT id FROM clips WHERE access_code = ?", *params.AccessCode).Scan(&existingID)
 		switch {
 		case err == nil:
-			return nil, &apperr.ValueError{Message: "直链码已存在，请刷新后再试"}
+			return nil, apperr.NewValueErrorCode(apperr.CodeAccessCodeConflict, "直链码已存在，请刷新后再试")
 		case errors.Is(err, sql.ErrNoRows):
 		default:
 			return nil, err
@@ -596,7 +596,7 @@ func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, erro
 		fileMime,
 	); err != nil {
 		if uniqueConstraintOn(err, "clips.access_code") {
-			return nil, &apperr.ValueError{Message: "直链码已存在，请刷新后再试"}
+			return nil, apperr.NewValueErrorCode(apperr.CodeAccessCodeConflict, "直链码已存在，请刷新后再试")
 		}
 		return nil, err
 	}
