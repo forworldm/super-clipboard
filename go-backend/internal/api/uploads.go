@@ -193,12 +193,43 @@ func (a *App) verifyCaptcha(w http.ResponseWriter, r *http.Request, token *strin
 	return true
 }
 
+// freeDiskSpace probes the free bytes of the volume holding path. Tests inject
+// a deterministic probe through App.freeBytesFn; production uses statfs.
+func (a *App) freeDiskSpace(path string) (int64, error) {
+	if a.freeBytesFn != nil {
+		return a.freeBytesFn(path)
+	}
+	return defaultFreeDiskBytes(path)
+}
+
+// checkDiskWatermark renders a typed 507 when the storage volume dropped below
+// MinFreeDiskBytes. It reports false once the response has been written.
+func (a *App) checkDiskWatermark(w http.ResponseWriter) bool {
+	minFree := a.Settings.EffectiveMinFreeDiskBytes()
+	if minFree <= 0 {
+		return true // watermark disabled
+	}
+	free, err := a.freeDiskSpace(a.Settings.FileStorageDir)
+	if err != nil {
+		// Unknown free space must not stop the service: the upload quota ledger
+		// still bounds total consumption.
+		a.logger.Printf("WARN:    unable to read free disk space: %v", err)
+		return true
+	}
+	if err := repository.CheckDiskWatermark(free, minFree); err != nil {
+		writeError(w, err)
+		return false
+	}
+	return true
+}
+
 // POST /api/uploads/init
 //
 // Ordering matters: fast idempotent replay first (a retried init must not be
 // blocked by the already-consumed captcha token), then captcha BEFORE any
 // session/disk is created (unverified clients can never consume storage),
-// then a race-safe insert keyed on (environment, requestId).
+// then the global storage gates (session cap, quota reservation, disk
+// watermark), then a race-safe insert keyed on (environment, requestId).
 func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
@@ -254,6 +285,47 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ---- Global storage gates. Fixed order: live-session cap, then quota
+	// reservation (atomic CAS in the DB), then the free-disk watermark. All of
+	// them run before the session row exists, so a refusal leaves nothing
+	// behind: no session, no bytes on disk, no dangling reservation.
+	quotaLimit := a.Settings.EffectiveUploadQuota()
+	sessionLimit := a.Settings.EffectiveMaxActiveUploadSessions()
+	if sessionLimit > 0 {
+		active, err := a.Repo.CountActiveUploadSessions()
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if active >= int64(sessionLimit) {
+			writeError(w, apperr.NewStorageError(apperr.StorageCodeSessionLimit,
+				"活动上传会话数已达上限：%d / %d，请完成或取消进行中的上传后重试", active, sessionLimit))
+			return
+		}
+	}
+
+	if err := a.Repo.ReserveUploadQuota(req.FileSize, quotaLimit); err != nil {
+		writeError(w, err)
+		return
+	}
+	// Until a session row owns the reservation it is ours to give back.
+	reservationHeld := true
+	releaseReservation := func() {
+		if !reservationHeld {
+			return
+		}
+		reservationHeld = false
+		if _, err := a.Repo.CompensateUploadQuota(req.FileSize); err != nil {
+			a.logger.Printf("ERROR:    unable to roll back %d byte upload quota reservation: %v", req.FileSize, err)
+		}
+	}
+	defer releaseReservation() // safety net for every early return below
+
+	if !a.checkDiskWatermark(w) {
+		releaseReservation()
+		return
+	}
+
 	chunkSize := a.Settings.EffectiveChunkSize()
 	ttl := a.Settings.EffectiveUploadTTL()
 	session, created, err := a.Repo.CreateOrGetUploadSession(repository.CreateUploadSessionParams{
@@ -262,11 +334,21 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		ChunkSize: chunkSize, TTLSeconds: ttl,
 	})
 	if err != nil {
+		releaseReservation()
 		writeError(w, err)
 		return
 	}
+	if created {
+		// The session row owns the reservation from here on; abort, expiry
+		// cleanup, complete rollback and complete success all return it through
+		// the idempotent quota_released CAS.
+		reservationHeld = false
+	}
 	if !created {
-		// Lost the insert race or an exact-replica row appeared in between.
+		// Lost the insert race or an exact-replica row appeared in between: the
+		// winning session already holds a reservation, so give ours back (a
+		// replayed init must never reserve twice).
+		releaseReservation()
 		received, listErr := a.Repo.ListReceivedChunks(session.ID)
 		if listErr != nil || received == nil {
 			received = []int{}
@@ -331,6 +413,11 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Body == nil {
 		writeError(w, newHTTPError(http.StatusBadRequest, "分片内容缺失"))
+		return
+	}
+	// Disk watermark: never stream bytes onto a volume below the free-space
+	// floor. Checked before the first byte is written so nothing lands on disk.
+	if !a.checkDiskWatermark(w) {
 		return
 	}
 	// Stream to disk (no global lock). Limit to expected size; overflow is 413.
@@ -889,6 +976,26 @@ func (a *App) ReconcileUploadsOnStartup() {
 			}
 		}
 	}
+	// 6) Upload quota ledger: an upgrade from a pre-quota database (or a crash
+	// between "reserve" and "insert") may leave the counter drifting.
+	a.reconcileUploadQuota()
+}
+
+// reconcileUploadQuota recomputes the reserved bytes from live sessions and
+// overwrites the ledger, then logs the result. It only fixes the counter --
+// no chunk dir and no clip file is touched.
+func (a *App) reconcileUploadQuota() {
+	recomputed, previous, err := a.Repo.RecomputeUploadQuota()
+	if err != nil {
+		a.logger.Printf("ERROR:    upload quota reconciliation failed: %v", err)
+		return
+	}
+	if recomputed != previous {
+		a.logger.Printf("WARN:     upload quota drift corrected: reserved_bytes %d -> %d (SUM(file_size) of active unreleased sessions)",
+			previous, recomputed)
+		return
+	}
+	a.logger.Printf("INFO:     upload quota reconciled: reserved_bytes = %d (no drift)", recomputed)
 }
 
 // purgeExpiredUploadsPeriodic is called by the cleanup worker (timeout path).

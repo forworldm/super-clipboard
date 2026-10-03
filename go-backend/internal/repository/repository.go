@@ -68,7 +68,8 @@ var createTableStatements = []string{
 		expires_at INTEGER NOT NULL,
 		staged_path TEXT,
 		clip_id TEXT,
-		request_id TEXT
+		request_id TEXT,
+		quota_released INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_expires_at ON upload_sessions(expires_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status)`,
@@ -80,7 +81,23 @@ var createTableStatements = []string{
 		PRIMARY KEY (upload_id, chunk_index)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_upload_chunks_upload_id ON upload_chunks(upload_id)`,
+	// upload_quota is a single-row ledger (id=1) holding the bytes currently
+	// reserved by live upload sessions. Reservations are moved in/out with
+	// atomic UPDATE ... WHERE predicates, never read-modify-write.
+	`CREATE TABLE IF NOT EXISTS upload_quota (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		reserved_bytes INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`,
 }
+
+// uploadQuotaSeedRow creates the single ledger row for databases that predate
+// the quota feature. The starting balance is the reservation the existing
+// active sessions would hold, so an upgrade never grants free credit.
+const uploadQuotaSeedRow = `INSERT INTO upload_quota (id, reserved_bytes, updated_at)
+	SELECT 1, COALESCE(SUM(file_size), 0), strftime('%s','now')
+	FROM upload_sessions WHERE status = 'active' AND quota_released = 0
+	ON CONFLICT(id) DO NOTHING`
 
 // uploadRequestIDIndex enforces init idempotency on (environment_id,
 // request_id) for sessions that carry a client requestId. Partial index so
@@ -216,7 +233,19 @@ func (r *ClipRepository) ensureSchema() error {
 		}
 		// De-dup guard: legacy rows carry NULL, which the partial index ignores.
 	}
+	// upload_sessions.quota_released: 0 = this session still holds its upload
+	// quota reservation. Legacy rows default to 0, i.e. they keep holding the
+	// reservation they were created with (the ledger seed below counts them).
+	if !uploadColumns["quota_released"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN quota_released INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
 	if _, err := r.db.Exec(uploadRequestIDIndex); err != nil {
+		return fmt.Errorf("unable to migrate schema: %w", err)
+	}
+	// upload_quota single row (id=1); created above, seeded once here.
+	if _, err := r.db.Exec(uploadQuotaSeedRow); err != nil {
 		return fmt.Errorf("unable to migrate schema: %w", err)
 	}
 	return nil

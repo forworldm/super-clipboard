@@ -38,9 +38,25 @@ type Settings struct {
 	CaptchaBypassToken     string
 	CaptchaSiteKey         string
 	// Chunked upload settings (server-generated, never trust client values).
-	UploadChunkSizeBytes   int
+	UploadChunkSizeBytes    int
 	UploadSessionTTLSeconds int
+	// Global upload disk quota (0 = unlimited). These three guards keep chunked
+	// uploads from eating the whole host disk: a per-session byte budget, a cap
+	// on concurrent sessions and a free-space watermark.
+	UploadTotalQuotaBytes   int64 // total bytes reserved by live upload sessions
+	MaxActiveUploadSessions int   // max concurrently active upload sessions
+	MinFreeDiskBytes        int64 // free-space watermark below which writes stop
+	// Warnings collects non-fatal configuration findings (surfaced at startup).
+	Warnings []string
 }
+
+// Global upload quota defaults: 10 GiB of reservations, 1000 live sessions and
+// a 1 GiB free-space watermark. Zero disables the matching guard.
+const (
+	DefaultUploadTotalQuotaBytes   int64 = 10 << 30 // 10 GiB
+	DefaultMaxActiveUploadSessions       = 1000
+	DefaultMinFreeDiskBytes        int64 = 1 << 30 // 1 GiB
+)
 
 // Defaults returns the same defaults as the Python Settings class.
 func Defaults() *Settings {
@@ -56,8 +72,11 @@ func Defaults() *Settings {
 		TokenExpiryHours:        720,
 		StaticRoot:              "dist",
 		CaptchaTimeoutSeconds:   6.0,
-		UploadChunkSizeBytes:    1 << 20, // 1 MiB per chunk, server-generated
+		UploadChunkSizeBytes:    1 << 20,      // 1 MiB per chunk, server-generated
 		UploadSessionTTLSeconds: 24 * 60 * 60, // 24h resume window
+		UploadTotalQuotaBytes:   DefaultUploadTotalQuotaBytes,
+		MaxActiveUploadSessions: DefaultMaxActiveUploadSessions,
+		MinFreeDiskBytes:        DefaultMinFreeDiskBytes,
 	}
 }
 
@@ -97,6 +116,31 @@ func (s *Settings) EffectiveUploadTTL() int {
 		return MaxUploadTTLSeconds
 	}
 	return s.UploadSessionTTLSeconds
+}
+
+// EffectiveUploadQuota returns the global upload byte budget (0 = unlimited).
+// Hand-built Settings in tests may carry negatives; treat them as "off".
+func (s *Settings) EffectiveUploadQuota() int64 {
+	if s == nil || s.UploadTotalQuotaBytes <= 0 {
+		return 0
+	}
+	return s.UploadTotalQuotaBytes
+}
+
+// EffectiveMaxActiveUploadSessions returns the live-session cap (0 = unlimited).
+func (s *Settings) EffectiveMaxActiveUploadSessions() int {
+	if s == nil || s.MaxActiveUploadSessions <= 0 {
+		return 0
+	}
+	return s.MaxActiveUploadSessions
+}
+
+// EffectiveMinFreeDiskBytes returns the free-space watermark (0 = unlimited).
+func (s *Settings) EffectiveMinFreeDiskBytes() int64 {
+	if s == nil || s.MinFreeDiskBytes <= 0 {
+		return 0
+	}
+	return s.MinFreeDiskBytes
 }
 
 // CaptchaEnabled reports whether a captcha provider is configured.
@@ -210,12 +254,39 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		func() error { return floatVar("CAPTCHA_TIMEOUT_SECONDS", &s.CaptchaTimeoutSeconds) },
 		func() error { return intVar("UPLOAD_CHUNK_SIZE_BYTES", &s.UploadChunkSizeBytes) },
 		func() error { return intVar("UPLOAD_SESSION_TTL_SECONDS", &s.UploadSessionTTLSeconds) },
+		func() error { return int64Var("UPLOAD_TOTAL_QUOTA_BYTES", &s.UploadTotalQuotaBytes) },
+		func() error { return intVar("MAX_ACTIVE_UPLOAD_SESSIONS", &s.MaxActiveUploadSessions) },
+		func() error { return int64Var("MIN_FREE_DISK_BYTES", &s.MinFreeDiskBytes) },
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
 			return nil, err
 		}
 	}
+	// Global upload quota guards: negatives are configuration errors (a
+	// negative budget is meaningless), 0 means "unlimited".
+	negativeGuard := []struct {
+		name  string
+		value int64
+	}{
+		{"UPLOAD_TOTAL_QUOTA_BYTES", s.UploadTotalQuotaBytes},
+		{"MAX_ACTIVE_UPLOAD_SESSIONS", int64(s.MaxActiveUploadSessions)},
+		{"MIN_FREE_DISK_BYTES", s.MinFreeDiskBytes},
+	}
+	for _, guard := range negativeGuard {
+		if guard.value < 0 {
+			return nil, fmt.Errorf("%s%s: value error, must be >= 0 (0 disables the limit)", EnvPrefix, guard.name)
+		}
+	}
+	// A total quota below the single-file cap can never admit a big file. This
+	// is a deployment smell, not a hard error: small files still work, so warn
+	// and keep serving.
+	if s.UploadTotalQuotaBytes > 0 && s.MaxFileSizeBytes > 0 && s.UploadTotalQuotaBytes < s.MaxFileSizeBytes {
+		s.Warnings = append(s.Warnings, fmt.Sprintf(
+			"%sUPLOAD_TOTAL_QUOTA_BYTES (%d bytes) < %sMAX_FILE_SIZE_BYTES (%d bytes): 接近上限的单文件将无法开始上传",
+			EnvPrefix, s.UploadTotalQuotaBytes, EnvPrefix, s.MaxFileSizeBytes))
+	}
+
 	// Clamp chunked-upload knobs so a bad env cannot break the protocol.
 	// Effective*() also guards hand-built Settings in tests.
 	s.UploadChunkSizeBytes = s.EffectiveChunkSize()

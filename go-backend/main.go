@@ -21,6 +21,9 @@ func main() {
 		logger.Printf("ERROR:    配置加载失败 / configuration error: %v", err)
 		os.Exit(1)
 	}
+	for _, warning := range settings.Warnings {
+		logger.Printf("WARN:     配置告警 / configuration warning: %s", warning)
+	}
 
 	repo, err := repository.NewClipRepository(settings)
 	if err != nil {

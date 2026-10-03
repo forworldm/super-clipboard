@@ -19,6 +19,7 @@ import (
 
 	"github.com/pixia1234/super-clipboard/backend/internal/config"
 	"github.com/pixia1234/super-clipboard/backend/internal/repository"
+	"github.com/pixia1234/super-clipboard/backend/internal/storage"
 	"github.com/pixia1234/super-clipboard/backend/internal/utils"
 )
 
@@ -37,7 +38,15 @@ type App struct {
 	mounts []staticMount
 	logger *log.Logger
 	client *http.Client
+	// freeBytesFn probes free disk space for the upload watermark; nil means
+	// "use defaultFreeDiskBytes". Tests inject a deterministic probe here.
+	freeBytesFn func(path string) (int64, error)
 }
+
+// defaultFreeDiskBytes is the production free-space probe (statfs). It is a
+// variable so tests can run the whole suite without depending on the free
+// space of the machine they run on.
+var defaultFreeDiskBytes = storage.FreeDiskBytes
 
 // NewApp builds the application. Route registration order matches main.py,
 // which matters because Starlette serves the first matching route.
@@ -295,6 +304,9 @@ func (a *App) cleanupWorker(ctx context.Context) {
 			// Timeout rollback for abandoned upload sessions (cancel without
 			// DELETE, network drop, browser closed mid-upload).
 			a.purgeExpiredUploadsPeriodic()
+			// Quota reconciliation: rebuild upload_quota.reserved_bytes from the
+			// sessions that should still hold a reservation, repairing drift.
+			a.reconcileUploadQuota()
 		}
 	}
 }

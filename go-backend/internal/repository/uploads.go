@@ -50,6 +50,10 @@ type UploadSession struct {
 	ExpiresAt     int64 // unix seconds
 	StagedPath    string // final assembled file (set when completing/completed)
 	ClipID        string // clip created by complete (empty for file-only sessions)
+	// QuotaReleased reports whether this session already returned its upload
+	// quota reservation. The flag + a CAS UPDATE makes release idempotent:
+	// abort/expire/complete can race, only one of them decrements the ledger.
+	QuotaReleased bool
 }
 
 // IsExpired reports whether the session passed its TTL.
@@ -115,9 +119,11 @@ func scanUploadSession(scan func(dest ...interface{}) error) (*UploadSession, er
 		chunkSize, totalChunks          int
 		createdAt, updatedAt, expiresAt int64
 		stagedPath, clipID, requestID   sql.NullString
+		quotaReleased                   int
 	)
 	if err := scan(&id, &filename, &fileSize, &mime, &chunkSize, &totalChunks,
-		&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID); err != nil {
+		&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID,
+		&quotaReleased); err != nil {
 		return nil, err
 	}
 	return &UploadSession{
@@ -126,11 +132,13 @@ func scanUploadSession(scan func(dest ...interface{}) error) (*UploadSession, er
 		EnvironmentID: env, RequestID: requestID.String,
 		CreatedAt: createdAt, UpdatedAt: updatedAt,
 		ExpiresAt: expiresAt, StagedPath: stagedPath.String, ClipID: clipID.String,
+		QuotaReleased: quotaReleased != 0,
 	}, nil
 }
 
 const uploadColumns = `id, filename, file_size, mime_type, chunk_size, total_chunks,
-	status, environment_id, created_at, updated_at, expires_at, staged_path, clip_id, request_id`
+	status, environment_id, created_at, updated_at, expires_at, staged_path, clip_id, request_id,
+	quota_released`
 
 // CreateUploadSessionParams groups arguments for CreateUploadSession.
 type CreateUploadSessionParams struct {
@@ -192,7 +200,7 @@ func (r *ClipRepository) insertUploadSession(session *UploadSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, err := r.db.Exec(`INSERT INTO upload_sessions (`+uploadColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0)`,
 		session.ID, session.Filename, session.FileSize, session.MimeType,
 		session.ChunkSize, session.TotalChunks, session.Status,
 		session.EnvironmentID, session.CreatedAt, session.UpdatedAt, session.ExpiresAt,
@@ -486,7 +494,20 @@ func (r *ClipRepository) CompleteUploadSession(uploadID string, clipID string) (
 	now := nowUnix()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	res, err := r.db.Exec(`UPDATE upload_sessions SET status = ?, clip_id = ?, updated_at = ?
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var fileSize int64
+	if err := tx.QueryRow(
+		"SELECT file_size FROM upload_sessions WHERE id = ?", uploadID).Scan(&fileSize); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errors.New("upload session not in completing state (aborted or expired?)")
+		}
+		return nil, err
+	}
+	res, err := tx.Exec(`UPDATE upload_sessions SET status = ?, clip_id = ?, updated_at = ?
 		WHERE id = ? AND status = ?`,
 		UploadStatusCompleted, nullIfEmpty(clipID), now, uploadID, UploadStatusCompleting)
 	if err != nil {
@@ -498,6 +519,14 @@ func (r *ClipRepository) CompleteUploadSession(uploadID string, clipID string) (
 	}
 	if affected != 1 {
 		return nil, errors.New("upload session not in completing state (aborted or expired?)")
+	}
+	// Option A: a finished upload returns its reservation in the very same
+	// transaction, so a crash can never leave the bytes reserved forever.
+	if _, err := r.releaseQuotaTx(tx, uploadID, fileSize); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	session, err := scanUploadSession(r.db.QueryRow(
 		"SELECT "+uploadColumns+" FROM upload_sessions WHERE id = ?", uploadID).Scan)
@@ -513,17 +542,32 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 	now := nowUnix()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var staged sql.NullString
-	if err := r.db.QueryRow(
-		"SELECT staged_path FROM upload_sessions WHERE id = ?", uploadID).Scan(&staged); err != nil {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var (
+		staged   sql.NullString
+		fileSize int64
+	)
+	if err := tx.QueryRow(
+		"SELECT staged_path, file_size FROM upload_sessions WHERE id = ?", uploadID).Scan(&staged, &fileSize); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil // already aborted: nothing to roll back
 		}
 		return "", err
 	}
-	if _, err := r.db.Exec(`UPDATE upload_sessions SET status = ?, staged_path = NULL, updated_at = ?
+	if _, err := tx.Exec(`UPDATE upload_sessions SET status = ?, staged_path = NULL, updated_at = ?
 		WHERE id = ? AND status = ?`,
 		UploadStatusActive, now, uploadID, UploadStatusCompleting); err != nil {
+		return "", err
+	}
+	// complete 失败回滚同样归还预留，且只能归还一次（quota_released CAS）。
+	if _, err := r.releaseQuotaTx(tx, uploadID, fileSize); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return staged.String, nil
@@ -557,6 +601,11 @@ func (r *ClipRepository) AbortUploadSession(uploadID string) (*UploadSession, er
 	if session.Status == UploadStatusCompleted && session.ClipID != "" {
 		return nil, &SessionCompletedError{Session: session}
 	}
+	// Return the reservation before the row disappears; the CAS keeps this
+	// idempotent when abort races expiry cleanup or a complete rollback.
+	if _, err := r.releaseQuotaTx(tx, session.ID, session.FileSize); err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec("DELETE FROM upload_chunks WHERE upload_id = ?", uploadID); err != nil {
 		return nil, err
 	}
@@ -574,6 +623,7 @@ type UploadPurgeVictim struct {
 	UploadID   string
 	StagedPath string
 	HasClip    bool
+	FileSize   int64
 }
 
 // PurgeExpiredUploads deletes expired sessions (any status) and returns victims
@@ -583,29 +633,29 @@ func (r *ClipRepository) PurgeExpiredUploads(nowUnixSec int64) ([]UploadPurgeVic
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows, err := r.db.Query(
-		"SELECT id, staged_path, clip_id FROM upload_sessions WHERE expires_at <= ?", nowUnixSec)
+		"SELECT id, staged_path, clip_id, file_size FROM upload_sessions WHERE expires_at <= ?", nowUnixSec)
 	if err != nil {
 		return nil, err
 	}
 	var victims []UploadPurgeVictim
-	var ids []string
 	for rows.Next() {
 		var id string
+		var fileSize int64
 		var staged, clip sql.NullString
-		if err := rows.Scan(&id, &staged, &clip); err != nil {
+		if err := rows.Scan(&id, &staged, &clip, &fileSize); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		victims = append(victims, UploadPurgeVictim{
 			UploadID: id, StagedPath: staged.String, HasClip: clip.String != "",
+			FileSize: fileSize,
 		})
-		ids = append(ids, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
+	if len(victims) == 0 {
 		return nil, nil
 	}
 	tx, err := r.db.Begin()
@@ -613,11 +663,16 @@ func (r *ClipRepository) PurgeExpiredUploads(nowUnixSec int64) ([]UploadPurgeVic
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	for _, id := range ids {
-		if _, err := tx.Exec("DELETE FROM upload_chunks WHERE upload_id = ?", id); err != nil {
+	for _, victim := range victims {
+		// Expiry cleanup returns the reservation exactly once, before the row
+		// (which carries the quota_released flag) is deleted.
+		if _, err := r.releaseQuotaTx(tx, victim.UploadID, victim.FileSize); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec("DELETE FROM upload_sessions WHERE id = ?", id); err != nil {
+		if _, err := tx.Exec("DELETE FROM upload_chunks WHERE upload_id = ?", victim.UploadID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec("DELETE FROM upload_sessions WHERE id = ?", victim.UploadID); err != nil {
 			return nil, err
 		}
 	}
@@ -683,9 +738,11 @@ func (r *ClipRepository) ListUploadSessions() ([]*UploadSession, error) {
 			chunkSize, totalChunks          int
 			createdAt, updatedAt, expiresAt int64
 			stagedPath, clipID, requestID   sql.NullString
+			quotaReleased                   int
 		)
 		if err := rows.Scan(&id, &filename, &fileSize, &mime, &chunkSize, &totalChunks,
-			&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID); err != nil {
+			&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID,
+			&quotaReleased); err != nil {
 			return nil, err
 		}
 		out = append(out, &UploadSession{
@@ -694,6 +751,7 @@ func (r *ClipRepository) ListUploadSessions() ([]*UploadSession, error) {
 			EnvironmentID: env, RequestID: requestID.String,
 			CreatedAt: createdAt, UpdatedAt: updatedAt,
 			ExpiresAt: expiresAt, StagedPath: stagedPath.String, ClipID: clipID.String,
+			QuotaReleased: quotaReleased != 0,
 		})
 	}
 	return out, rows.Err()

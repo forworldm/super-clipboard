@@ -71,6 +71,13 @@ func writeError(w http.ResponseWriter, err error) {
 		writeJSONResponse(w, httpError.Status, httpError.Detail)
 		return
 	}
+	// Typed storage guards (quota / session cap / disk watermark) are all 507
+	// but keep their own message so the client can tell which limit tripped.
+	var storageError *apperr.StorageError
+	if errors.As(err, &storageError) {
+		writeJSONResponse(w, storageError.HTTPStatus(), storageError.Message)
+		return
+	}
 	var valueError *apperr.ValueError
 	if errors.As(err, &valueError) {
 		writeJSONResponse(w, http.StatusBadRequest, valueError.Message)
