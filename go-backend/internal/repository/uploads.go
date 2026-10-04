@@ -75,12 +75,32 @@ type UploadSession struct {
 	ClipAccessToken  *string
 }
 
-// IsExpired reports whether the session passed its TTL.
+// IsExpired reports whether the session passed its resume TTL.
 func (s *UploadSession) IsExpired(nowUnix int64) bool {
 	if s == nil {
 		return true
 	}
 	return nowUnix >= s.ExpiresAt
+}
+
+// AcceptsReplay reports whether a retried request may still be answered from
+// this session instead of allocating a new one.
+//
+// A COMPLETED session is ALWAYS replayable, whatever its expires_at says: it is
+// kept only as an idempotency record (its clip is the deliverable and it holds
+// no reservation anymore), so expiry governs when the cleanup worker drops the
+// row -- never whether a retry of init/complete/GET gets the same answer. Using
+// expires_at here would turn the short replay window into a duplicate upload:
+// the same (environment, requestId) would create a second session and a second
+// clip. Live (active/completing) sessions still honour their resume TTL.
+func (s *UploadSession) AcceptsReplay(nowUnix int64) bool {
+	if s == nil {
+		return false
+	}
+	if s.Status == UploadStatusCompleted {
+		return true
+	}
+	return !s.IsExpired(nowUnix)
 }
 
 // ExpectedChunkSize returns the exact byte size a chunk index must carry.
@@ -345,7 +365,7 @@ func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionPara
 				return nil, false, lookupErr
 			}
 			if existing != nil {
-				if !existing.IsExpired(nowUnix()) {
+				if existing.AcceptsReplay(nowUnix()) {
 					return existing, false, nil
 				}
 				// Expired key: purge the stale row so the fresh insert below can
@@ -397,7 +417,7 @@ func (r *ClipRepository) replayExistingSession(env string, requestID string) (*U
 	if existing == nil {
 		return nil, false, errors.New("unable to create upload session (idempotency conflict)")
 	}
-	if existing.IsExpired(nowUnix()) {
+	if !existing.AcceptsReplay(nowUnix()) {
 		return nil, false, &SessionUnavailableError{Session: existing}
 	}
 	return existing, false, nil
@@ -643,6 +663,20 @@ type SessionCompletingError struct{ Session *UploadSession }
 
 func (e *SessionCompletingError) Error() string { return "upload is completing" }
 
+// completedExpiry returns the expiry a successful session keeps for idempotent
+// replay: now + ttl, never later than the expiry it already had (a client may
+// have asked for a shorter resume window than the configured replay window).
+func completedExpiry(nowUnix int64, currentExpiry int64, ttlSeconds int) int64 {
+	if ttlSeconds <= 0 {
+		return currentExpiry
+	}
+	candidate := nowUnix + int64(ttlSeconds)
+	if currentExpiry > 0 && currentExpiry < candidate {
+		return currentExpiry
+	}
+	return candidate
+}
+
 func nullIfEmpty(s string) interface{} {
 	if s == "" {
 		return nil
@@ -681,17 +715,26 @@ func (r *ClipRepository) CompleteUploadSession(uploadID string, clipID string) (
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var fileSize int64
+	var (
+		fileSize  int64
+		expiresAt int64
+	)
 	if err := tx.QueryRow(
-		"SELECT file_size FROM upload_sessions WHERE id = ?", uploadID).Scan(&fileSize); err != nil {
+		"SELECT file_size, expires_at FROM upload_sessions WHERE id = ?", uploadID).Scan(&fileSize, &expiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errors.New("upload session not in completing state (aborted or expired?)")
 		}
 		return nil, err
 	}
-	res, err := tx.Exec(`UPDATE upload_sessions SET status = ?, clip_id = ?, updated_at = ?
+	// A finished session stops being a resume candidate, so it drops the long
+	// resume TTL: expires_at shrinks to the (much shorter) idempotency window.
+	// Only the row is affected -- the clip and its file are independent of it --
+	// which keeps finished rows, and their (environment_id, request_id) slot,
+	// from lingering for a whole day.
+	res, err := tx.Exec(`UPDATE upload_sessions SET status = ?, clip_id = ?, updated_at = ?, expires_at = ?
 		WHERE id = ? AND status = ?`,
-		UploadStatusCompleted, nullIfEmpty(clipID), now, uploadID, UploadStatusCompleting)
+		UploadStatusCompleted, nullIfEmpty(clipID), now, completedExpiry(now, expiresAt, r.settings.EffectiveCompletedUploadTTL()),
+		uploadID, UploadStatusCompleting)
 	if err != nil {
 		return nil, err
 	}

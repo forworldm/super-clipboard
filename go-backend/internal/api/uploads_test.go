@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pixia1234/super-clipboard/backend/internal/config"
+	"github.com/pixia1234/super-clipboard/backend/internal/repository"
 	"github.com/pixia1234/super-clipboard/backend/internal/storage"
 )
 
@@ -1027,5 +1028,124 @@ func TestConfigExposesUploadKnobs(t *testing.T) {
 	}
 	if _, ok := payload["uploadSessionTTLSeconds"].(float64); !ok {
 		t.Fatalf("ttl knob missing: %v", payload)
+	}
+}
+
+// TestCompletedSessionRetainedForIdempotentRetry locks the retention contract of
+// a successful upload:
+//
+//   - the session row is NOT deleted on success. It stays as the idempotency
+//     record of (environmentId, requestId) so a client whose response was lost
+//     can retry init/GET/complete and always gets the same uploadId and the same
+//     clip -- never a second session, a second container or a second clip;
+//   - the row only keeps a SHORT replay window (expires_at is rewritten by
+//     COMPLETE), so it cannot pin the row and its requestId slot for the whole
+//     resume TTL;
+//   - while that row exists, `expires_at` is IGNORED by the replay paths (a
+//     finished session is not resumable, only replayable), so a retry that lands
+//     after the window elapsed but before the cleanup worker ran still replays
+//     instead of starting a duplicate upload;
+//   - once the worker purges the row, the clip and its file survive and the key
+//     becomes reusable by a genuinely new upload.
+func TestCompletedSessionRetainedForIdempotentRetry(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t, smallChunkSettings())
+	env := "env-retained"
+	const requestID = "req-retained-1"
+	fileSize := 4096
+	data := deterministicBytes(fileSize)
+
+	init := initClipUpload(t, app, "retained.bin", int64(fileSize), "application/octet-stream", env,
+		map[string]interface{}{"requestId": requestID})
+	uploadID := init["uploadId"].(string)
+	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
+	first := completeUpload(t, app, uploadID, nil)
+	requireStatus(t, first, http.StatusCreated)
+	clipID := decode(t, first)["id"].(string)
+
+	// 1) The row survives the success: it is the idempotency record.
+	session, err := app.Repo.GetUploadSession(uploadID)
+	if err != nil || session == nil {
+		t.Fatalf("a successful upload must keep its session row: %v %v", session, err)
+	}
+	if session.Status != repository.UploadStatusCompleted || session.ClipID != clipID {
+		t.Fatalf("unexpected finished session %+v", session)
+	}
+	if !session.QuotaReleased || session.FileSize != int64(fileSize) {
+		t.Fatalf("the finished session must have returned its %d byte reservation: %+v", fileSize, session)
+	}
+	// 2) ... for a SHORT window only, not the resume TTL.
+	now := time.Now().UTC().Unix()
+	replayWindow := int64(app.Settings.EffectiveCompletedUploadTTL())
+	if replayWindow >= int64(app.Settings.EffectiveUploadTTL()) {
+		t.Fatalf("the replay window (%ds) must be shorter than the resume TTL (%ds)",
+			replayWindow, app.Settings.EffectiveUploadTTL())
+	}
+	if session.ExpiresAt > now+replayWindow {
+		t.Fatalf("completed expires_at = %d, want <= now+%d (short replay window)", session.ExpiresAt, replayWindow)
+	}
+	if session.ExpiresAt >= session.CreatedAt+int64(app.Settings.EffectiveUploadTTL()) {
+		t.Fatal("COMPLETE must rewrite the resume expiry to the short replay window")
+	}
+
+	// 3) Replay window elapsed (worker has not run yet): expires_at must not turn
+	// the retry into a new upload. A fresh, later expiresAt in the init body is
+	// deliberately ignored for a finished session.
+	if err := app.Repo.SetUploadExpiryForTest(uploadID, 1); err != nil {
+		t.Fatalf("force expiry: %v", err)
+	}
+	retryInit := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "retained.bin", "fileSize": fileSize, "mimeType": "application/octet-stream",
+		"environmentId": env, "expiresAt": futureTimestamp(3), "requestId": requestID,
+	})
+	requireStatus(t, retryInit, http.StatusOK)
+	if got := decode(t, retryInit)["uploadId"]; got != uploadID {
+		t.Fatalf("a retried init must replay the finished session, got %v want %s", got, uploadID)
+	}
+	info := decode(t, getUpload(t, app, uploadID))
+	if info["status"] != repository.UploadStatusCompleted {
+		t.Fatalf("GET must still report the finished session, got %v", info)
+	}
+	again := completeUpload(t, app, uploadID, nil)
+	requireStatus(t, again, http.StatusOK)
+	if got := decode(t, again)["id"]; got != clipID {
+		t.Fatalf("a retried complete must return the original clip, got %v want %s", got, clipID)
+	}
+	if got := activeSessions(t, app); got != 1 {
+		t.Fatalf("replaying must never open a second session, got %d", got)
+	}
+	if names := storageFileNames(t, app); len(names) != 1 {
+		t.Fatalf("replaying must never allocate a second container, got %v", names)
+	}
+	if got := reservedValue(t, app); got != 0 {
+		t.Fatalf("reserved = %d after replays, want 0 (success returned it once)", got)
+	}
+	clips := decode(t, do(t, app, http.MethodGet, "/api/clips?environmentId="+env, nil))
+	if got := len(clips["items"].([]interface{})); got != 1 {
+		t.Fatalf("exactly one clip expected, got %d", got)
+	}
+
+	// 4) The cleanup worker finally drops the row: the clip file and the clip row
+	// survive, the ledger does not move, and the key can be reused.
+	app.purgeExpiredUploadsPeriodic()
+	if purged, _ := app.Repo.GetUploadSession(uploadID); purged != nil {
+		t.Fatalf("the cleanup worker should have purged the finished row, got %+v", purged)
+	}
+	if names := storageFileNames(t, app); len(names) != 1 {
+		t.Fatalf("the clip file must survive the purge of its session row, got %v", names)
+	}
+	if got := reservedValue(t, app); got != 0 {
+		t.Fatalf("reserved = %d after the purge, want 0", got)
+	}
+	requireStatus(t, do(t, app, http.MethodGet, "/api/clips/"+clipID+"/file?environmentId="+env, nil), http.StatusOK)
+	requireStatus(t, getUpload(t, app, uploadID), http.StatusNotFound)
+
+	fresh := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "retained-2.bin", "fileSize": 64, "mimeType": "application/octet-stream",
+		"environmentId": env, "expiresAt": futureTimestamp(2), "requestId": requestID,
+	})
+	requireStatus(t, fresh, http.StatusCreated)
+	if got := decode(t, fresh)["uploadId"]; got == uploadID {
+		t.Fatal("a purged key must be reusable by a new upload")
 	}
 }

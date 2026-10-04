@@ -16,10 +16,20 @@ import (
 
 func newTestRepository(t *testing.T) *ClipRepository {
 	t.Helper()
+	return newTestRepositoryWith(t, nil)
+}
+
+// newTestRepositoryWith opens a repository on tuned settings (retention TTLs,
+// quotas, ...). nil mutator keeps the shipped defaults.
+func newTestRepositoryWith(t *testing.T, mutate func(*config.Settings)) *ClipRepository {
+	t.Helper()
 	dir := t.TempDir()
 	settings := config.Defaults()
 	settings.DatabasePath = filepath.Join(dir, "clips.db")
 	settings.FileStorageDir = filepath.Join(dir, "files")
+	if mutate != nil {
+		mutate(settings)
+	}
 	repo, err := NewClipRepository(settings)
 	if err != nil {
 		t.Fatalf("unable to open repository: %v", err)

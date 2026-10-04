@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/pixia1234/super-clipboard/backend/internal/config"
 )
 
 func TestCalcTotalChunks(t *testing.T) {
@@ -582,5 +584,106 @@ func TestInitReplayRefusesStaleInFlightSession(t *testing.T) {
 	other.RequestID = "req-other"
 	if _, created, err := repo.CreateOrGetUploadSession(other); err != nil || !created {
 		t.Fatalf("unrelated key should still create: %v %v", created, err)
+	}
+}
+
+// TestCompleteShortensSessionExpiry: a finished session drops the long resume
+// TTL and keeps only the short idempotency window, so its row (and the
+// (environment_id, request_id) slot it holds) disappears quickly instead of
+// pinning the row for the whole resume window.
+func TestCompleteShortensSessionExpiry(t *testing.T) {
+	const completedTTL = 5
+	repo := newTestRepositoryWith(t, func(s *config.Settings) { s.CompletedUploadTTLSeconds = completedTTL })
+	session := createReservingSession(t, repo, "short.bin", 2048, 0)
+	now := time.Now().UTC().Unix()
+	if session.ExpiresAt <= now+60 {
+		t.Fatalf("a live session must keep the long resume window, got %d", session.ExpiresAt)
+	}
+	for i := 0; i < session.TotalChunks; i++ {
+		if err := repo.MarkChunkReceived(session.ID, i, 1024); err != nil {
+			t.Fatalf("mark chunk %d: %v", i, err)
+		}
+	}
+	if _, _, err := repo.TryBeginComplete(session.ID); err != nil {
+		t.Fatalf("begin complete: %v", err)
+	}
+	completed, err := repo.CompleteUploadSession(session.ID, "clip-short")
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if completed.ExpiresAt > time.Now().UTC().Unix()+completedTTL {
+		t.Fatalf("completed session expires_at = %d, want <= now+%d", completed.ExpiresAt, completedTTL)
+	}
+	if completed.ExpiresAt >= session.ExpiresAt {
+		t.Fatalf("complete must shorten the expiry (%d -> %d)", session.ExpiresAt, completed.ExpiresAt)
+	}
+	// The shortened expiry is what lets the worker drop the row: past it the
+	// session is purged, and the clip it produced is reported so the file lives on.
+	victims, err := repo.PurgeExpiredUploads(time.Now().UTC().Unix() + completedTTL + 1)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if len(victims) != 1 || !victims[0].HasClip {
+		t.Fatalf("expected one clip-backed victim, got %+v", victims)
+	}
+	if purged, _ := repo.GetUploadSession(completed.ID); purged != nil {
+		t.Fatalf("the finished session row must be gone, got %+v", purged)
+	}
+}
+
+// TestAcceptsReplayIgnoresExpiryForCompletedSession locks the idempotency
+// contract: expires_at is a CLEANUP knob for a finished session, never a reason
+// to answer a retry with "gone" (which would make the client upload again).
+func TestAcceptsReplayIgnoresExpiryForCompletedSession(t *testing.T) {
+	now := time.Now().UTC().Unix()
+	active := &UploadSession{Status: UploadStatusActive, ExpiresAt: now + 1}
+	expired := &UploadSession{Status: UploadStatusActive, ExpiresAt: now - 1}
+	completed := &UploadSession{Status: UploadStatusCompleted, ExpiresAt: now - 1}
+	completing := &UploadSession{Status: UploadStatusCompleting, ExpiresAt: now - 1}
+
+	if !active.AcceptsReplay(now) {
+		t.Fatal("a live session must accept a replay")
+	}
+	if expired.AcceptsReplay(now) {
+		t.Fatal("an expired live session must not accept a replay")
+	}
+	if !completed.AcceptsReplay(now) {
+		t.Fatal("a completed session must stay replayable whatever expires_at says")
+	}
+	if completing.AcceptsReplay(now) {
+		t.Fatal("an expired completing session must not accept a replay")
+	}
+	// A concurrent init must replay (never replace) a completed key too.
+	repo := newTestRepository(t)
+	params := CreateUploadSessionParams{
+		Filename: "replay.bin", FileSize: 64, MimeType: "application/octet-stream",
+		EnvironmentID: "env-replay", ChunkSize: 1024, TTLSeconds: 3600, RequestID: "req-done",
+	}
+	session, created, err := repo.CreateOrGetUploadSession(params)
+	if err != nil || !created {
+		t.Fatalf("first init: created=%v err=%v", created, err)
+	}
+	if err := repo.MarkChunkReceived(session.ID, 0, 64); err != nil {
+		t.Fatalf("mark chunk: %v", err)
+	}
+	if _, _, err := repo.TryBeginComplete(session.ID); err != nil {
+		t.Fatalf("begin complete: %v", err)
+	}
+	if _, err := repo.CompleteUploadSession(session.ID, "clip-replay"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	// Expiry already elapsed (the replay window is short) but the row still exists.
+	if err := repo.SetUploadExpiryForTest(session.ID, 1); err != nil {
+		t.Fatalf("force expiry: %v", err)
+	}
+	replayed, created, err := repo.CreateOrGetUploadSession(params)
+	if err != nil {
+		t.Fatalf("replay init: %v", err)
+	}
+	if created || replayed == nil || replayed.ID != session.ID {
+		t.Fatalf("a finished key must be replayed as-is, got created=%v session=%+v", created, replayed)
+	}
+	if sessions, _ := repo.ListUploadSessions(); len(sessions) != 1 {
+		t.Fatalf("a replay must not open a second session, got %d", len(sessions))
 	}
 }

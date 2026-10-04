@@ -87,7 +87,12 @@ func (a *App) loadActiveUpload(w http.ResponseWriter, uploadID string) (session 
 		writeError(w, newHTTPError(http.StatusNotFound, "上传会话不存在"))
 		return nil, nil, false, false
 	}
-	if s.IsExpired(time.Now().UTC().Unix()) {
+	// Expiry only ends the *resume* window. A completed session is a pure
+	// idempotency record (see UploadSession.AcceptsReplay): its row may outlive
+	// expires_at until the cleanup worker drops it, and in that window a retry
+	// must still get the original answer instead of a 410 that would make the
+	// client upload the file again.
+	if !s.AcceptsReplay(time.Now().UTC().Unix()) {
 		a.expireUploadNow(s)
 		writeError(w, newHTTPError(http.StatusGone, "上传会话已过期，请重新上传"))
 		return nil, nil, false, true
@@ -161,6 +166,16 @@ func (a *App) freeDiskSpace(path string) (int64, error) {
 	return defaultFreeDiskBytes(path)
 }
 
+// preallocateUploadFile materialises the session's byte container at its final
+// path and length. Tests replace App.preallocateUploadFn to exercise the failure
+// path (row committed, container missing).
+func (a *App) preallocateUploadFile(path string, size int64) error {
+	if a.preallocateUploadFn != nil {
+		return a.preallocateUploadFn(path, size)
+	}
+	return storage.PreallocateFile(path, size)
+}
+
 // checkDiskWatermark renders a typed 507 when the storage volume dropped below
 // MinFreeDiskBytes. It reports false once the response has been written.
 func (a *App) checkDiskWatermark(w http.ResponseWriter) bool {
@@ -223,7 +238,10 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if existing != nil {
-			if !existing.IsExpired(time.Now().UTC().Unix()) {
+			// Ignore expires_at for a finished session: it is replayable until
+			// its row is actually purged, so a retried init can never open a
+			// second session (and a second clip) for the same requestId.
+			if existing.AcceptsReplay(time.Now().UTC().Unix()) {
 				received, listErr := a.Repo.ListReceivedChunks(existing.ID)
 				if listErr != nil || received == nil {
 					received = []int{}
@@ -373,8 +391,13 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// File creation is IO outside the repository lock. On failure roll back the
 	// DB row (which also returns the reservation) so no orphan session remains.
-	if err := storage.PreallocateFile(finalPath, session.FileSize); err != nil {
-		_, _ = a.Repo.AbortUploadSession(session.ID)
+	if err := a.preallocateUploadFile(finalPath, session.FileSize); err != nil {
+		// The row exists, so the reservation is already owned by a session row:
+		// abort returns it through the quota_released CAS (the deferred
+		// releaseReservation() above must NOT run -- it would decrement twice).
+		if _, abortErr := a.Repo.AbortUploadSession(session.ID); abortErr != nil {
+			a.logger.Printf("ERROR:    unable to roll back session %s after pre-allocation failure: %v", session.ID, abortErr)
+		}
 		_ = storage.RemoveUploadFile(finalPath)
 		a.logger.Printf("ERROR:    unable to pre-allocate upload file %s: %v", finalPath, err)
 		writeError(w, newHTTPError(http.StatusInternalServerError, "无法创建上传文件，请重试"))
@@ -1009,4 +1032,11 @@ func (a *App) purgeExpiredUploadsPeriodic() {
 		return
 	}
 	a.deleteUploadVictimFiles(victims)
+	// Reap containers that no session row and no clip references any more. This
+	// closes the last orphan path: an expired idempotency key purged inside the
+	// repository (init racing the worker) returns no victim to the handler, so
+	// nobody would delete the old container until the next process start.
+	// A live upload can never be reaped: its row is inserted BEFORE its file is
+	// created, so an in-flight container is always referenced.
+	a.sweepOrphanUploadFiles()
 }

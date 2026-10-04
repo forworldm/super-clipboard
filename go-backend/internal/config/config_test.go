@@ -180,3 +180,54 @@ func TestStaticHelpers(t *testing.T) {
 		t.Fatalf("unexpected index path %s", settings.StaticIndex())
 	}
 }
+
+// TestCompletedUploadTTL covers the replay window of a finished upload session:
+// it defaults to 5 minutes, is configurable, and can never be longer than the
+// resume TTL (a finished session must not outlive a live one) nor shorter than
+// MinCompletedUploadTTLSeconds.
+func TestCompletedUploadTTL(t *testing.T) {
+	dir := t.TempDir()
+	base := append(testEnviron(dir), "SUPER_CLIPBOARD_APP_PORT=5174")
+	load := func(extra ...string) *Settings {
+		t.Helper()
+		settings, err := LoadFrom(append(base, extra...), filepath.Join(dir, "missing.env"))
+		if err != nil {
+			t.Fatalf("load settings: %v", err)
+		}
+		return settings
+	}
+
+	defaults := load()
+	if defaults.CompletedUploadTTLSeconds != DefaultCompletedUploadTTLSeconds {
+		t.Fatalf("default replay window = %d, want %d", defaults.CompletedUploadTTLSeconds, DefaultCompletedUploadTTLSeconds)
+	}
+	if defaults.EffectiveCompletedUploadTTL() >= defaults.EffectiveUploadTTL() {
+		t.Fatalf("the replay window (%d) must stay below the resume TTL (%d)",
+			defaults.EffectiveCompletedUploadTTL(), defaults.EffectiveUploadTTL())
+	}
+
+	if got := load("SUPER_CLIPBOARD_UPLOAD_COMPLETED_TTL_SECONDS=42").EffectiveCompletedUploadTTL(); got != 42 {
+		t.Fatalf("override replay window = %d, want 42", got)
+	}
+
+	// Never longer than the resume TTL: a finished session is dropped no later
+	// than a live one would be.
+	capped := load("SUPER_CLIPBOARD_UPLOAD_SESSION_TTL_SECONDS=60",
+		"SUPER_CLIPBOARD_UPLOAD_COMPLETED_TTL_SECONDS=99999")
+	if capped.EffectiveCompletedUploadTTL() != 60 {
+		t.Fatalf("replay window = %d, want the 60s resume TTL", capped.EffectiveCompletedUploadTTL())
+	}
+
+	// Hand-built (or partially populated) settings never lose the window.
+	empty := &Settings{}
+	if got := empty.EffectiveCompletedUploadTTL(); got != DefaultCompletedUploadTTLSeconds {
+		t.Fatalf("zero-value settings replay window = %d, want %d", got, DefaultCompletedUploadTTLSeconds)
+	}
+	negative := &Settings{CompletedUploadTTLSeconds: -30, UploadSessionTTLSeconds: 3600}
+	if got := negative.EffectiveCompletedUploadTTL(); got != DefaultCompletedUploadTTLSeconds {
+		t.Fatalf("negative replay window = %d, want the default", got)
+	}
+	if got := (&Settings{CompletedUploadTTLSeconds: 1, UploadSessionTTLSeconds: 3600}).EffectiveCompletedUploadTTL(); got != 1 {
+		t.Fatalf("1s replay window = %d, want 1 (tests rely on it)", got)
+	}
+}

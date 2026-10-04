@@ -83,6 +83,18 @@ recompute = SUM(file_size) FROM upload_sessions WHERE status='active' AND quota_
 
 响应体保持 `{"detail": "..."}`，现有 API 契约不变。
 
+## 7.5 成功会话的保留窗口（与配额的交互）
+
+- complete 成功时，同一事务内 `CompleteUploadSession` 释放预留（`quota_released` CAS）并把
+  `expires_at` 收缩为 `min(now + CompletedUploadTTL, 原值)`，默认 300s
+  （`SUPER_CLIPBOARD_UPLOAD_COMPLETED_TTL_SECONDS`）。行继续作为 `requestId` 幂等凭据，
+  但不再长期占用 resume 窗口。
+- 因此 purge 一定会在“配额已释放”之后才看到该行：`releaseQuotaTx` 的行内 CAS 落空，
+  不会二次扣减（`TestPurgeExpiredCompletedUploadDoesNotReleaseQuotaTwice` /
+  `TestPurgeAfterCompleteDoesNotReleaseQuotaTwice`）。
+- 幂等判定 (`UploadSession.AcceptsReplay`) 对 `completed` 会话忽略 `expires_at`；
+  详见 `docs/completed-upload-retention.md`。
+
 ## 8. 提交与验收
 
 | 提交 | 内容 | 验收命令 |

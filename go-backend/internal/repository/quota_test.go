@@ -315,6 +315,117 @@ func TestFailCompleteKeepsReservationUntilTerminal(t *testing.T) {
 	}
 }
 
+// TestPurgeExpiredCompletedUploadDoesNotReleaseQuotaTwice is the regression
+// test for the "success + purge" double release: a successful COMPLETE already
+// returned the reservation (option A), so the later expiry purge of the very
+// same session row must contribute nothing.
+//
+// A sentinel reservation that is LARGER than the finished session is held
+// throughout: the ledger can only stay on that exact value if the purge took
+// nothing, so any second decrement of the 2048 finished bytes would be visible
+// (and would have eaten a live session's budget).
+func TestPurgeExpiredCompletedUploadDoesNotReleaseQuotaTwice(t *testing.T) {
+	repo := newTestRepository(t)
+	sentinel := createReservingSession(t, repo, "sentinel.bin", 5000, 0)
+	session := createReservingSession(t, repo, "done.bin", 2048, 5000)
+
+	for i := 0; i < session.TotalChunks; i++ {
+		if err := repo.MarkChunkReceived(session.ID, i, 1024); err != nil {
+			t.Fatalf("mark chunk %d: %v", i, err)
+		}
+	}
+	if _, _, err := repo.TryBeginComplete(session.ID); err != nil {
+		t.Fatalf("begin complete: %v", err)
+	}
+	completed, err := repo.CompleteUploadSession(session.ID, "clip-done")
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	// Success returned the reservation exactly once: only the sentinel remains.
+	if !completed.QuotaReleased {
+		t.Fatal("a completed session must be flagged quota_released")
+	}
+	if got := reservedBytes(t, repo); got != sentinel.FileSize {
+		t.Fatalf("reserved = %d after complete, want the %d byte sentinel", got, sentinel.FileSize)
+	}
+
+	// The replay window elapsed (a finished session keeps a SHORT expiry), so the
+	// cleanup worker purges the row.
+	if err := repo.SetUploadExpiryForTest(completed.ID, 1); err != nil {
+		t.Fatalf("force expiry: %v", err)
+	}
+	victims, err := repo.PurgeExpiredUploads(time.Now().UTC().Unix())
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if len(victims) != 1 || victims[0].UploadID != completed.ID {
+		t.Fatalf("expected the finished session in the purge victims, got %+v", victims)
+	}
+	if !victims[0].HasClip {
+		t.Fatal("the purge victim must report its clip so the clip file is kept")
+	}
+	if got := reservedBytes(t, repo); got != sentinel.FileSize {
+		t.Fatalf("reserved = %d after purging the finished session, want the %d byte sentinel untouched",
+			got, sentinel.FileSize)
+	}
+
+	// Every other terminal path racing the purge stays a no-op as well: the row
+	// (which carries the quota_released CAS flag) is gone, so nothing can be
+	// returned a second time.
+	released, err := repo.ReleaseUploadQuota(completed.ID, completed.FileSize)
+	if err != nil {
+		t.Fatalf("release after purge: %v", err)
+	}
+	if released {
+		t.Fatal("a purged session must not release its reservation again")
+	}
+	if _, err := repo.AbortUploadSession(completed.ID); err == nil {
+		t.Fatal("aborting a purged session must fail (row is gone)")
+	}
+	if got := reservedBytes(t, repo); got != sentinel.FileSize {
+		t.Fatalf("reserved = %d after extra release attempts, want %d", got, sentinel.FileSize)
+	}
+	// A second purge finds nothing and leaves the ledger untouched.
+	if victims, err := repo.PurgeExpiredUploads(time.Now().UTC().Unix()); err != nil || len(victims) != 0 {
+		t.Fatalf("second purge: victims=%+v err=%v, want none", victims, err)
+	}
+	if got := reservedBytes(t, repo); got != sentinel.FileSize {
+		t.Fatalf("reserved = %d after second purge, want %d", got, sentinel.FileSize)
+	}
+}
+
+// TestCompensateUploadQuotaNeverEatsLiveReservations covers the error path where
+// init reserved bytes but never published a session row (disk watermark, insert
+// error, losing the idempotency race): the token is handed back exactly once and
+// the ledger can never go negative or eat another session's budget.
+func TestCompensateUploadQuotaNeverEatsLiveReservations(t *testing.T) {
+	repo := newTestRepository(t)
+	live := createReservingSession(t, repo, "live.bin", 400, 0)
+
+	// The unclaimed reservation of an init that failed before INSERT.
+	if err := repo.ReserveUploadQuota(700, 0); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if got := reservedBytes(t, repo); got != 1100 {
+		t.Fatalf("reserved = %d, want 1100 (400 live + 700 unclaimed)", got)
+	}
+	ok, err := repo.CompensateUploadQuota(700)
+	if err != nil || !ok {
+		t.Fatalf("compensate: ok=%v err=%v", ok, err)
+	}
+	if got := reservedBytes(t, repo); got != live.FileSize {
+		t.Fatalf("reserved = %d after compensation, want the %d byte live session", got, live.FileSize)
+	}
+	// A replayed compensation (the deferred cleanup plus an explicit call) finds
+	// nothing to give back instead of borrowing the live session's bytes.
+	if ok, err := repo.CompensateUploadQuota(700); err != nil || ok {
+		t.Fatalf("second compensation must be refused: ok=%v err=%v", ok, err)
+	}
+	if got := reservedBytes(t, repo); got < 0 || got != live.FileSize {
+		t.Fatalf("reserved = %d, want %d (never negative)", got, live.FileSize)
+	}
+}
+
 // TestActiveUploadSessionCount is the counter behind MaxActiveUploadSessions.
 func TestActiveUploadSessionCount(t *testing.T) {
 	repo := newTestRepository(t)

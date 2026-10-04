@@ -455,3 +455,122 @@ func TestStorageGuardsAnswerDistinct507(t *testing.T) {
 		})
 	}
 }
+
+// errPreallocate stands in for a failing container creation (ENOSPC, EROFS, ...).
+var errPreallocate = fmt.Errorf("pre-allocation failed")
+
+// TestInitPreallocationFailureReturnsReservation covers the init error path that
+// used to be hardest to reason about: the session row is committed (so it owns
+// the reservation) and the container creation then fails. The abort returns the
+// reservation through the quota_released CAS exactly ONCE -- the handler's
+// deferred compensation must not decrement a second time -- so a live sentinel
+// reservation is left untouched and the idempotency key is free for the retry.
+func TestInitPreallocationFailureReturnsReservation(t *testing.T) {
+	app := newTestApp(t, quotaSettings(2000, 0, 0))
+	const sentinelBytes int64 = 700
+	sentinel := initUpload(t, app, "sentinel.bin", sentinelBytes, "application/octet-stream", "env-pre-fail")
+	sentinelID := sentinel["uploadId"].(string)
+	if got := storageFileCount(t, app); got != 1 {
+		t.Fatalf("sentinel container missing: %v", storageFileNames(t, app))
+	}
+
+	app.preallocateUploadFn = func(string, int64) error { return errPreallocate }
+	rec := initRaw(t, app, "fail.bin", 500, "env-pre-fail", "req-fail-1")
+	requireStatus(t, rec, http.StatusInternalServerError)
+	requireDetail(t, rec, "无法创建上传文件")
+
+	// Row gone, container gone, and exactly the sentinel's 700 bytes reserved.
+	if got := reservedValue(t, app); got != sentinelBytes {
+		t.Fatalf("reserved = %d after a failed init, want the %d byte sentinel", got, sentinelBytes)
+	}
+	if got := activeSessions(t, app); got != 1 {
+		t.Fatalf("a failed init must leave exactly the sentinel session, got %d", got)
+	}
+	if names := storageFileNames(t, app); len(names) != 1 {
+		t.Fatalf("a failed init must leave no container behind, got %v", names)
+	}
+
+	// The key was released with the row: retrying the very same init works.
+	app.preallocateUploadFn = nil
+	retry := initRaw(t, app, "fail.bin", 500, "env-pre-fail", "req-fail-1")
+	requireStatus(t, retry, http.StatusCreated)
+	retryID := decode(t, retry)["uploadId"].(string)
+	if retryID == sentinelID {
+		t.Fatal("the retry must create a fresh session, not replay the failed one")
+	}
+	if got := reservedValue(t, app); got != 1200 {
+		t.Fatalf("reserved = %d after the retry, want 1200 (700 sentinel + 500 upload)", got)
+	}
+
+	// Both sessions can still be returned, one at a time.
+	requireStatus(t, do(t, app, http.MethodDelete, "/api/uploads/"+sentinelID, nil), http.StatusOK)
+	if got := reservedValue(t, app); got != 500 {
+		t.Fatalf("reserved = %d after aborting the sentinel, want 500", got)
+	}
+	requireStatus(t, do(t, app, http.MethodDelete, "/api/uploads/"+retryID, nil), http.StatusOK)
+	if got := reservedValue(t, app); got != 0 {
+		t.Fatalf("reserved = %d after aborting both sessions, want 0", got)
+	}
+}
+
+// TestPurgeAfterCompleteDoesNotReleaseQuotaTwice drives the "release twice" race
+// through the API: the successful COMPLETE returns the reservation, and the
+// cleanup worker then purges the finished session row (which carries the
+// quota_released CAS flag). The 700 byte sentinel proves the ledger never moved
+// a second time, and the clip keeps its bytes and serves its file.
+func TestPurgeAfterCompleteDoesNotReleaseQuotaTwice(t *testing.T) {
+	app := newTestApp(t, quotaSettings(2000, 0, 0))
+	env := "env-purge-once"
+	const sentinelBytes int64 = 1200
+	sentinel := initUpload(t, app, "sentinel.bin", sentinelBytes, "application/octet-stream", env)
+	sentinelID := sentinel["uploadId"].(string)
+
+	payload := initClipUpload(t, app, "finished.bin", 500, "application/octet-stream", env,
+		map[string]interface{}{"requestId": "req-purge-once"})
+	uploadID := payload["uploadId"].(string)
+	requireStatus(t, putChunk(t, app, uploadID, 0, deterministicBytes(500)), http.StatusOK)
+	done := completeUpload(t, app, uploadID, nil)
+	requireStatus(t, done, http.StatusCreated)
+	clipID := decode(t, done)["id"].(string)
+	if got := reservedValue(t, app); got != sentinelBytes {
+		t.Fatalf("complete must return the 500 bytes exactly once, reserved = %d", got)
+	}
+	filesBefore := storageFileCount(t, app)
+
+	// Replay window elapsed: the worker purges the finished row.
+	if err := app.Repo.SetUploadExpiryForTest(uploadID, 1); err != nil {
+		t.Fatalf("force expiry: %v", err)
+	}
+	app.purgeExpiredUploadsPeriodic()
+
+	if purged, _ := app.Repo.GetUploadSession(uploadID); purged != nil {
+		t.Fatalf("the finished session row should be purged, got %+v", purged)
+	}
+	if got := reservedValue(t, app); got != sentinelBytes {
+		t.Fatalf("purge released the finished reservation a second time: reserved = %d, want %d",
+			got, sentinelBytes)
+	}
+	// The clip and its file are independent of the session row: both survive.
+	if got := storageFileCount(t, app); got != filesBefore {
+		t.Fatalf("purging a finished session must keep the clip file: %d -> %d (%v)",
+			filesBefore, got, storageFileNames(t, app))
+	}
+	requireStatus(t, do(t, app, http.MethodGet, "/api/clips/"+clipID+"/file?environmentId="+env, nil), http.StatusOK)
+
+	// Idempotent maintenance: a second pass changes nothing.
+	app.purgeExpiredUploadsPeriodic()
+	if got := reservedValue(t, app); got != sentinelBytes {
+		t.Fatalf("reserved = %d after a second purge, want %d", got, sentinelBytes)
+	}
+
+	// Deleting the clip afterwards returns only the sentinel; the finished
+	// session's bytes are never handed back twice.
+	requireStatus(t, do(t, app, http.MethodDelete, "/api/clips/"+clipID+"?environmentId="+env, nil), http.StatusOK)
+	if got := reservedValue(t, app); got != sentinelBytes {
+		t.Fatalf("deleting the clip moved the upload ledger: reserved = %d", got)
+	}
+	requireStatus(t, do(t, app, http.MethodDelete, "/api/uploads/"+sentinelID, nil), http.StatusOK)
+	if got := reservedValue(t, app); got != 0 {
+		t.Fatalf("reserved = %d after aborting the sentinel, want 0", got)
+	}
+}

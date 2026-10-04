@@ -42,6 +42,14 @@ type Settings struct {
 	// Chunked upload settings (server-generated, never trust client values).
 	UploadChunkSizeBytes    int
 	UploadSessionTTLSeconds int
+	// CompletedUploadTTLSeconds is the idempotency window of a FINISHED upload
+	// session. A successful upload never needs its row again (the clip is the
+	// deliverable); the row is kept only so a client that lost the response can
+	// replay COMPLETE/INIT. The resume TTL would be far too generous for that --
+	// it would pin the row and its (environment_id, request_id) key for a whole
+	// day -- so COMPLETE rewrites expires_at to this smaller value and the
+	// cleanup worker drops the row right after the window.
+	CompletedUploadTTLSeconds int
 	// Global upload disk quota (0 = unlimited). These three guards keep chunked
 	// uploads from eating the whole host disk: a per-session byte budget, a cap
 	// on concurrent sessions and a free-space watermark.
@@ -70,6 +78,11 @@ const (
 	// expires). It sits above DefaultMaxFileSizeBytes so a single allowed file
 	// always fits into an empty store.
 	DefaultStoredTotalQuotaBytes int64 = 10 << 30 // 10 GiB
+
+	// DefaultCompletedUploadTTLSeconds is how long a finished upload session row
+	// survives so a retry can be replayed idempotently: 5 minutes (far more than
+	// any client retry ladder, far less than the 24h resume window).
+	DefaultCompletedUploadTTLSeconds = 300
 )
 
 // Defaults returns the same defaults as the Python Settings class.
@@ -88,10 +101,12 @@ func Defaults() *Settings {
 		CaptchaTimeoutSeconds:   6.0,
 		UploadChunkSizeBytes:    1 << 20,      // 1 MiB per chunk, server-generated
 		UploadSessionTTLSeconds: 24 * 60 * 60, // 24h resume window
-		UploadTotalQuotaBytes:   DefaultUploadTotalQuotaBytes,
-		MaxActiveUploadSessions: DefaultMaxActiveUploadSessions,
-		MinFreeDiskBytes:        DefaultMinFreeDiskBytes,
-		StoredTotalQuotaBytes:   DefaultStoredTotalQuotaBytes,
+		// Finished sessions only stay for a short replay window.
+		CompletedUploadTTLSeconds: DefaultCompletedUploadTTLSeconds,
+		UploadTotalQuotaBytes:     DefaultUploadTotalQuotaBytes,
+		MaxActiveUploadSessions:   DefaultMaxActiveUploadSessions,
+		MinFreeDiskBytes:          DefaultMinFreeDiskBytes,
+		StoredTotalQuotaBytes:     DefaultStoredTotalQuotaBytes,
 	}
 }
 
@@ -102,6 +117,9 @@ const (
 	MaxUploadChunkSizeBytes = 8 << 20       // 8 MiB
 	MinUploadTTLSeconds     = 60            // 1 minute (tests use small TTLs)
 	MaxUploadTTLSeconds     = 7 * 24 * 3600 // 7 days
+	// MinCompletedUploadTTLSeconds is 1s so tests can watch a finished session
+	// expire without sleeping; production defaults to 5 minutes.
+	MinCompletedUploadTTLSeconds = 1
 )
 
 // EffectiveChunkSize returns a sane chunk size even if Settings was built
@@ -131,6 +149,27 @@ func (s *Settings) EffectiveUploadTTL() int {
 		return MaxUploadTTLSeconds
 	}
 	return s.UploadSessionTTLSeconds
+}
+
+// EffectiveCompletedUploadTTL returns the replay window of a finished upload
+// session, bounded by the resume TTL (a completed session can never outlive a
+// live one) and never below MinCompletedUploadTTLSeconds.
+func (s *Settings) EffectiveCompletedUploadTTL() int {
+	fallback := DefaultCompletedUploadTTLSeconds
+	if s == nil {
+		return fallback
+	}
+	ttl := s.CompletedUploadTTLSeconds
+	if ttl <= 0 {
+		ttl = fallback
+	}
+	if ttl < MinCompletedUploadTTLSeconds {
+		ttl = MinCompletedUploadTTLSeconds
+	}
+	if max := s.EffectiveUploadTTL(); ttl > max {
+		ttl = max
+	}
+	return ttl
 }
 
 // EffectiveUploadQuota returns the global upload byte budget (0 = unlimited).
@@ -279,6 +318,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		func() error { return floatVar("CAPTCHA_TIMEOUT_SECONDS", &s.CaptchaTimeoutSeconds) },
 		func() error { return intVar("UPLOAD_CHUNK_SIZE_BYTES", &s.UploadChunkSizeBytes) },
 		func() error { return intVar("UPLOAD_SESSION_TTL_SECONDS", &s.UploadSessionTTLSeconds) },
+		func() error { return intVar("UPLOAD_COMPLETED_TTL_SECONDS", &s.CompletedUploadTTLSeconds) },
 		func() error { return int64Var("UPLOAD_TOTAL_QUOTA_BYTES", &s.UploadTotalQuotaBytes) },
 		func() error { return intVar("MAX_ACTIVE_UPLOAD_SESSIONS", &s.MaxActiveUploadSessions) },
 		func() error { return int64Var("MIN_FREE_DISK_BYTES", &s.MinFreeDiskBytes) },
@@ -325,6 +365,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 	// Effective*() also guards hand-built Settings in tests.
 	s.UploadChunkSizeBytes = s.EffectiveChunkSize()
 	s.UploadSessionTTLSeconds = s.EffectiveUploadTTL()
+	s.CompletedUploadTTLSeconds = s.EffectiveCompletedUploadTTL()
 
 	// @field_validator("captcha_provider") normalize_provider
 	if value, ok := lookup("CAPTCHA_PROVIDER"); ok {

@@ -41,6 +41,11 @@ type App struct {
 	// freeBytesFn probes free disk space for the upload watermark; nil means
 	// "use defaultFreeDiskBytes". Tests inject a deterministic probe here.
 	freeBytesFn func(path string) (int64, error)
+	// preallocateUploadFn creates/resizes the byte container of a session; nil
+	// means "use storage.PreallocateFile". It is a test seam: the only way to
+	// exercise the "row committed but container creation failed" path, which is
+	// where the upload quota reservation must be handed back exactly once.
+	preallocateUploadFn func(path string, size int64) error
 }
 
 // defaultFreeDiskBytes is the production free-space probe (statfs). It is a
