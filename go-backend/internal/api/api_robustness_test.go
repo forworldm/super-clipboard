@@ -448,4 +448,3 @@ func TestRunWithContextShutdown(t *testing.T) {
 		t.Fatalf("RunWithContext should shut down cleanly, got %v", err)
 	}
 }
-

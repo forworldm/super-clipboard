@@ -69,7 +69,11 @@ var createTableStatements = []string{
 		staged_path TEXT,
 		clip_id TEXT,
 		request_id TEXT,
-		quota_released INTEGER NOT NULL DEFAULT 0
+		quota_released INTEGER NOT NULL DEFAULT 0,
+		clip_expires_at INTEGER,
+		clip_max_downloads INTEGER,
+		clip_access_code TEXT,
+		clip_access_token TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_expires_at ON upload_sessions(expires_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status)`,
@@ -238,6 +242,28 @@ func (r *ClipRepository) ensureSchema() error {
 	// reservation they were created with (the ledger seed below counts them).
 	if !uploadColumns["quota_released"] {
 		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN quota_released INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	// Clip params captured at init so /complete can create the clip without
+	// the client re-sending (and re-validating) expiresAt/accessCode/etc.
+	if !uploadColumns["clip_expires_at"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN clip_expires_at INTEGER"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	if !uploadColumns["clip_max_downloads"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN clip_max_downloads INTEGER"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	if !uploadColumns["clip_access_code"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN clip_access_code TEXT"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+	}
+	if !uploadColumns["clip_access_token"] {
+		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN clip_access_token TEXT"); err != nil {
 			return fmt.Errorf("unable to migrate schema: %w", err)
 		}
 	}

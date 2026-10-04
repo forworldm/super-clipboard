@@ -59,11 +59,74 @@ func TestCreateAndGetUploadSession(t *testing.T) {
 	}
 }
 
+func TestCreateUploadSessionPersistsClipParams(t *testing.T) {
+	repo := newTestRepository(t)
+	code := "abcde"
+	token := "tok-1234"
+	maxDownloads := 7
+	s, err := repo.CreateUploadSession(CreateUploadSessionParams{
+		Filename: "clip.bin", FileSize: 100, MimeType: "application/octet-stream",
+		EnvironmentID: "env-clip", ChunkSize: 1024, TTLSeconds: 60,
+		ClipExpiresAt:    9_999_999_999_999,
+		ClipMaxDownloads: &maxDownloads, ClipAccessCode: &code, ClipAccessToken: &token,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := repo.GetUploadSession(s.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	// Every session carries its owner and its clip params.
+	if got.ClipExpiresAt != 9_999_999_999_999 || got.EnvironmentID != "env-clip" {
+		t.Fatalf("clip expires/owner not persisted: %+v", got)
+	}
+	if got.ClipMaxDownloads == nil || *got.ClipMaxDownloads != 7 {
+		t.Fatalf("maxDownloads not persisted: %+v", got)
+	}
+	if got.ClipAccessCode == nil || *got.ClipAccessCode != code {
+		t.Fatalf("accessCode not persisted: %+v", got)
+	}
+	if got.ClipAccessToken == nil || *got.ClipAccessToken != token {
+		t.Fatalf("accessToken not persisted: %+v", got)
+	}
+	// A nameless clip (reachable only through its env owner) persists as such.
+	nameless, err := repo.CreateUploadSession(CreateUploadSessionParams{
+		Filename: "nameless.bin", FileSize: 10, EnvironmentID: "env-nameless",
+		ChunkSize: 1024, TTLSeconds: 60, ClipExpiresAt: 9_999_999_999_999,
+	})
+	if err != nil {
+		t.Fatalf("nameless create: %v", err)
+	}
+	reloaded, _ := repo.GetUploadSession(nameless.ID)
+	if reloaded.EnvironmentID != "env-nameless" || reloaded.ClipAccessCode != nil || reloaded.ClipAccessToken != nil {
+		t.Fatalf("nameless session should keep only its owner: %+v", reloaded)
+	}
+}
+
+// TestCreateUploadSessionRequiresEnvironmentID: upload sessions have no
+// ownerless mode, so the repository refuses to persist one.
+func TestCreateUploadSessionRequiresEnvironmentID(t *testing.T) {
+	repo := newTestRepository(t)
+	for _, env := range []string{"", "   "} {
+		if _, err := repo.CreateUploadSession(CreateUploadSessionParams{
+			Filename: "ownerless.bin", FileSize: 10, EnvironmentID: env,
+			ChunkSize: 1024, TTLSeconds: 60, ClipExpiresAt: 9_999_999_999_999,
+		}); err == nil {
+			t.Fatalf("environment id %q must be refused", env)
+		}
+	}
+	if sessions, _ := repo.ListUploadSessions(); len(sessions) != 0 {
+		t.Fatalf("no session row may be written, got %v", sessions)
+	}
+}
+
 func TestUploadExpectedChunkSize(t *testing.T) {
 	repo := newTestRepository(t)
 	s, err := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 2500, ChunkSize: 1024, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -82,7 +145,8 @@ func TestUploadExpectedChunkSize(t *testing.T) {
 	// Empty file: no chunks.
 	empty, err := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "empty.txt", FileSize: 0, ChunkSize: 1024, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	if err != nil {
 		t.Fatalf("create empty: %v", err)
 	}
@@ -98,7 +162,8 @@ func TestMarkChunkReceivedIdempotent(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 3000, ChunkSize: 1000, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	if err := repo.MarkChunkReceived(s.ID, 1, 1000); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
@@ -130,7 +195,8 @@ func TestTryBeginCompleteFlow(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 2000, ChunkSize: 1000, TTLSeconds: 3600,
-	})
+
+		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(s.ID, 0, 1000)
 	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/staged"); err == nil {
 		t.Fatalf("should fail with missing chunks")
@@ -199,7 +265,8 @@ func TestAbortUploadSession(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 100, ChunkSize: 1000, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(s.ID, 0, 100)
 	aborted, err := repo.AbortUploadSession(s.ID)
 	if err != nil {
@@ -217,7 +284,8 @@ func TestAbortUploadSession(t *testing.T) {
 	// Completed with clip is not abortable.
 	s2, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "b.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	if _, _, err := repo.TryBeginComplete(s2.ID, "/tmp/s"); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -230,7 +298,8 @@ func TestAbortUploadSession(t *testing.T) {
 	// Completed file-only IS abortable (drops staged file).
 	s3, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "c.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	if _, _, err := repo.TryBeginComplete(s3.ID, "/tmp/s3"); err != nil {
 		t.Fatalf("begin s3: %v", err)
 	}
@@ -246,10 +315,12 @@ func TestPurgeExpiredUploads(t *testing.T) {
 	repo := newTestRepository(t)
 	alive, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "alive.bin", FileSize: 10, ChunkSize: 1000, TTLSeconds: 3600,
-	})
+
+		EnvironmentID: "env-test"})
 	stale, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "stale.bin", FileSize: 10, ChunkSize: 1000, TTLSeconds: 3600,
-	})
+
+		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(stale.ID, 0, 10)
 	// Force expiry.
 	if _, err := repo.db.Exec("UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
@@ -278,7 +349,8 @@ func TestResetStuckCompleting(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 3600,
-	})
+
+		EnvironmentID: "env-test"})
 	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/stuck"); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -354,7 +426,8 @@ func TestDeleteAndRestoreChunkRecords(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 3000, ChunkSize: 1000, TTLSeconds: 60,
-	})
+
+		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(s.ID, 0, 1000)
 	_ = repo.MarkChunkReceived(s.ID, 1, 1000)
 	if err := repo.DeleteChunkRecords(s.ID, []int{1}); err != nil {

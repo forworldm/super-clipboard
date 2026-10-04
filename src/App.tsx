@@ -615,7 +615,9 @@ const App = () => {
         const created = await uploadFileChunked({
           file: selectedFile.file,
           filename: selectedFile.name,
-          environmentId: settings.environmentId,
+          // environmentId + expiresAt are required: every upload becomes a file
+          // clip, owned by this environment (that is how a nameless clip
+          // without access code/token is listed).
           clip: {
             environmentId: settings.environmentId,
             expiresAt: Date.now() + hoursToMilliseconds(expiresInHours),
@@ -623,9 +625,9 @@ const App = () => {
             accessCode: accessMode === "code" ? activeShortCode : undefined,
             accessToken: usingToken ? tokenValue : undefined
           },
-          // Captcha is verified once at init (before any chunk consumes
-          // storage); the complete call deliberately does not re-send it
-          // because Turnstile tokens are single-use.
+          // Captcha and the clip params are sent at init so they are validated
+          // before any chunk consumes storage; complete only assembles the
+          // already-validated session.
           captchaToken: isCaptchaEnabled ? captchaToken : undefined,
           captchaProvider: captchaProvider ?? undefined,
           concurrency: 3,

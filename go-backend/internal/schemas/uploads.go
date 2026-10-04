@@ -1,22 +1,37 @@
 package schemas
 
 import (
-	"bytes"
 	"strings"
 )
 
 // UploadInitRequest mirrors POST /api/uploads/init.
-// Captcha is verified at init (BEFORE any chunk consumes disk), closing the
+//
+// There is no such thing as a "regular file upload": every chunked upload
+// becomes a file clip, so the clip parameters arrive with the init request and
+// are validated here -- BEFORE a session row or a single chunk byte exists.
+// They are then frozen on the session row and reused by /complete, which never
+// re-accepts them (a client cannot fix a rejected parameter afterwards).
+//
+// Captcha is verified at init too (BEFORE any chunk consumes disk), closing the
 // storage-DoS where an attacker fills all chunks and only then trips captcha.
 // RequestID is a client idempotency key for safe init retries.
 type UploadInitRequest struct {
-	Filename        string
-	FileSize        int64
-	MimeType        string
+	Filename string
+	FileSize int64
+	MimeType string
+	// EnvironmentID is mandatory. Without an accessCode/accessToken the clip is
+	// a nameless clip: only its environment owner can ever list/open it, so a
+	// clip without an owner would be unreachable garbage.
 	EnvironmentID   string
 	RequestID       string
 	CaptchaToken    *string
 	CaptchaProvider *string
+	// Clip fields, validated like ClipCreateRequest. ExpiresAt is mandatory for
+	// the same reason: clips.expires_at is NOT NULL and must be in the future.
+	ExpiresAt    int64
+	MaxDownloads *int
+	AccessCode   *string
+	AccessToken  *string
 }
 
 // ParseUploadInitRequest validates the init body (422 on invalid).
@@ -31,10 +46,36 @@ func ParseUploadInitRequest(body []byte) (*UploadInitRequest, *ValidationError) 
 	geZero := int64(0)
 	fileSize, _ := fields.requiredInt("fileSize", nil, &geZero)
 	mimeOpt, _ := fields.optionalString("mimeType", 0, 255)
-	envOpt, _ := fields.optionalString("environmentId", 0, 64)
+	// environmentId is mandatory for every upload (see UploadInitRequest).
+	env, _ := fields.requiredString("environmentId", 1, 64)
 	requestIDOpt, okReq := fields.optionalString("requestId", 4, 128)
 	captchaToken, okCaptcha := fields.optionalString("captchaToken", 1, 4096)
 	captchaProvider, _ := fields.optionalLiteral("captchaProvider", []string{"turnstile", "recaptcha"})
+
+	// Clip params: expiresAt is required (a clip without a future expiry can
+	// never be created), maxDownloads/accessCode/accessToken stay optional.
+	greaterThanZero := int64(0)
+	expiresAt, _ := fields.requiredInt("expiresAt", &greaterThanZero, nil)
+	maxDownloads, _ := fields.optionalInt("maxDownloads", &greaterThanZero, nil)
+	var accessCode *string
+	code, okCode := fields.optionalString("accessCode", 5, 12)
+	if okCode && code != nil {
+		t := strings.TrimSpace(*code)
+		switch {
+		case t == "":
+			accessCode = nil
+		case !isAlphanumeric(t):
+			fields.fieldError("accessCode", "直链码需由字母或数字组成", *code)
+		default:
+			accessCode = &t
+		}
+	}
+	var accessToken *string
+	token, okToken := fields.optionalString("accessToken", 7, 0)
+	if okToken && token != nil {
+		t := strings.TrimSpace(*token)
+		accessToken = &t
+	}
 	if validationError := fields.result(); validationError != nil {
 		return nil, validationError
 	}
@@ -63,19 +104,30 @@ func ParseUploadInitRequest(body []byte) (*UploadInitRequest, *ValidationError) 
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
-	env := ""
-	if envOpt != nil {
-		env = strings.TrimSpace(*envOpt)
-	}
 	out := &UploadInitRequest{
 		Filename: trimmedName, FileSize: fileSize, MimeType: mime,
-		EnvironmentID: env, RequestID: requestID, CaptchaProvider: captchaProvider,
+		EnvironmentID: strings.TrimSpace(env), RequestID: requestID,
+		CaptchaProvider: captchaProvider,
+		ExpiresAt:       expiresAt, MaxDownloads: maxDownloads,
+		AccessCode: accessCode, AccessToken: accessToken,
 	}
 	if okCaptcha && captchaToken != nil {
 		trimmed := strings.TrimSpace(*captchaToken)
 		if trimmed != "" {
 			out.CaptchaToken = &trimmed
 		}
+	}
+	// @model_validator(mode="after") mirrors ClipCreateRequest: a blank
+	// environmentId is as invalid as a missing one.
+	input := decodeInput(body)
+	if out.AccessToken != nil && *out.AccessToken != "" && strings.TrimSpace(out.EnvironmentID) == "" {
+		fields.modelError("持久 Token 校验失败，请重新保存", input)
+	}
+	if strings.TrimSpace(out.EnvironmentID) == "" {
+		fields.modelError("environmentId 缺失", input)
+	}
+	if validationError := fields.result(); validationError != nil {
+		return nil, validationError
 	}
 	return out, nil
 }
@@ -138,94 +190,7 @@ type UploadChunkResponse struct {
 	Complete       bool   `json:"complete"`
 }
 
-// UploadCompleteClipParams carries optional clip-creation fields for
-// POST /api/uploads/{id}/complete. Empty body == file-only assembly.
-// Captcha is NOT part of complete anymore: it gates session creation in init
-// so storage is never consumed by unverified clients.
-type UploadCompleteClipParams struct {
-	HasClipFields bool
-	EnvironmentID string
-	ExpiresAt     int64
-	MaxDownloads  *int
-	AccessCode    *string
-	AccessToken   *string
-}
-
-// ParseUploadCompleteRequest parses the complete body.
-//   - empty/whitespace/"{}" -> file-only (HasClipFields=false, no error)
-//   - otherwise validates clip fields (422 on invalid), mirroring ClipCreateRequest.
-//   - captchaToken/captchaProvider keys are accepted but ignored (back-compat
-//     with older clients); captcha is verified at init instead.
-func ParseUploadCompleteRequest(body []byte) (*UploadCompleteClipParams, *ValidationError) {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 || string(trimmed) == "{}" || string(trimmed) == "null" {
-		return &UploadCompleteClipParams{HasClipFields: false}, nil
-	}
-	fields, validationError := parseObject(body, []interface{}{"body"})
-	if validationError != nil {
-		return nil, validationError
-	}
-	// Detect whether any clip field is present; if none, treat as file-only.
-	// (ignored keys like captchaToken do not count as clip fields)
-	hasAny := false
-	for _, k := range []string{"environmentId", "expiresAt", "maxDownloads", "accessCode", "accessToken"} {
-		if _, ok := fields.raw[k]; ok {
-			hasAny = true
-			break
-		}
-	}
-	if !hasAny {
-		return &UploadCompleteClipParams{HasClipFields: false}, nil
-	}
-	params := &UploadCompleteClipParams{HasClipFields: true}
-	greaterThanZero := int64(0)
-	expiresAt, _ := fields.requiredInt("expiresAt", &greaterThanZero, nil)
-	params.ExpiresAt = expiresAt
-	maxDownloads, _ := fields.optionalInt("maxDownloads", &greaterThanZero, nil)
-	params.MaxDownloads = maxDownloads
-	accessCode, okCode := fields.optionalString("accessCode", 5, 12)
-	if okCode && accessCode != nil {
-		t := strings.TrimSpace(*accessCode)
-		switch {
-		case t == "":
-			params.AccessCode = nil
-		case !isAlphanumeric(t):
-			fields.fieldError("accessCode", "直链码需由字母或数字组成", *accessCode)
-		default:
-			params.AccessCode = &t
-		}
-	}
-	accessToken, okToken := fields.optionalString("accessToken", 7, 0)
-	if okToken && accessToken != nil {
-		t := strings.TrimSpace(*accessToken)
-		params.AccessToken = &t
-	}
-	envID, _ := fields.requiredString("environmentId", 1, 64)
-	params.EnvironmentID = envID
-	if validationError := fields.result(); validationError != nil {
-		return nil, validationError
-	}
-	input := decodeInput(bytes.Clone(body))
-	if params.AccessToken != nil && *params.AccessToken != "" && strings.TrimSpace(params.EnvironmentID) == "" {
-		fields.modelError("持久 Token 校验失败，请重新保存", input)
-	}
-	if strings.TrimSpace(params.EnvironmentID) == "" {
-		fields.modelError("environmentId 缺失", input)
-	}
-	if validationError := fields.result(); validationError != nil {
-		return nil, validationError
-	}
-	return params, nil
-}
-
-// UploadCompleteFileResponse mirrors file-only complete success.
-type UploadCompleteFileResponse struct {
-	UploadID string `json:"uploadId"`
-	Status   string `json:"status"`
-	File     struct {
-		Name string `json:"name"`
-		Size int64  `json:"size"`
-		Type string `json:"type"`
-	} `json:"file"`
-	ExpiresAt int64 `json:"expiresAt"`
-}
+// NOTE: POST /api/uploads/{id}/complete has no request model on purpose. Every
+// upload ends as a file clip, and the clip parameters were captured (and
+// validated) by UploadInitRequest at init, so complete only replays the values
+// stored on the session row. Its success body is a ClipResponse.

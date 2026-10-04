@@ -173,28 +173,36 @@ export type UploadChunkResponse = {
   complete: boolean;
 };
 
-export type UploadCompleteClipParams = {
+// Every chunked upload becomes a file clip, so these params are part of the
+// INIT request: they are validated and persisted server-side before a single
+// chunk is stored, and /complete replays the stored copy (it never accepts
+// them again). A clip without accessCode/accessToken is a nameless clip that
+// only its environment owner can see.
+export type UploadClipParams = {
+  // Required: the clip's owner is the only way to list a nameless clip.
   environmentId: string;
+  // Required: clips.expiresAt must be in the future.
   expiresAt: number;
   maxDownloads?: number;
   accessCode?: string;
   accessToken?: string;
-  // Note: captcha is NOT part of complete anymore. Captcha is verified once
-  // at init (before any chunk consumes storage), and Turnstile tokens are
-  // single-use by design — re-sending would fail the idempotent complete
-  // replay path unnecessarily.
 };
 
 export type UploadInitParams = {
   filename: string;
   fileSize: number;
   mimeType?: string;
-  environmentId?: string;
+  environmentId: string;
   // Client-generated idempotency key: safe init retries return the same
   // session (replay) instead of creating a duplicate session on disk.
   requestId?: string;
   captchaToken?: string;
   captchaProvider?: "turnstile" | "recaptcha";
+  // Clip params, validated and persisted at init.
+  expiresAt: number;
+  maxDownloads?: number;
+  accessCode?: string;
+  accessToken?: string;
 };
 
 const requestRaw = async <T>(
@@ -247,15 +255,21 @@ const requestRaw = async <T>(
 export const initFileUpload = async (
   params: UploadInitParams
 ): Promise<UploadInitResponse> => {
+  // environmentId + expiresAt are mandatory server-side: every upload becomes a
+  // file clip and a clip needs an owner and an expiry.
   const body: Record<string, unknown> = {
     filename: params.filename,
     fileSize: params.fileSize,
     mimeType: params.mimeType ?? "application/octet-stream",
-    environmentId: params.environmentId ?? ""
+    environmentId: params.environmentId,
+    expiresAt: params.expiresAt
   };
   if (params.requestId) body.requestId = params.requestId;
   if (params.captchaToken) body.captchaToken = params.captchaToken;
   if (params.captchaProvider) body.captchaProvider = params.captchaProvider;
+  if (params.maxDownloads != null) body.maxDownloads = params.maxDownloads;
+  if (params.accessCode) body.accessCode = params.accessCode;
+  if (params.accessToken) body.accessToken = params.accessToken;
   return request<UploadInitResponse>(`${API_BASE}/uploads/init`, {
     method: "POST",
     body: JSON.stringify(body)
@@ -287,31 +301,21 @@ export const uploadChunkBytes = async (
   );
 };
 
-export const completeUploadAsClip = async (
+// completeUpload assembles the chunks and inserts the file clip, using the clip
+// params frozen at init. It carries NO body: there is no file-only mode, and
+// re-sending params here would be ignored anyway.
+export const completeUpload = async (
   uploadId: string,
-  clip: UploadCompleteClipParams,
   opts?: { signal?: AbortSignal }
 ): Promise<RemoteClip> => {
   const data = await requestRaw<ApiClip>(
     `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/complete`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(clip),
       signal: opts?.signal
     }
   );
   return mapClip(data);
-};
-
-export const completeUploadFileOnly = async (
-  uploadId: string,
-  opts?: { signal?: AbortSignal }
-): Promise<{ uploadId: string; status: string }> => {
-  return requestRaw(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}/complete`, {
-    method: "POST",
-    signal: opts?.signal
-  });
 };
 
 export const abortFileUpload = async (uploadId: string): Promise<void> => {

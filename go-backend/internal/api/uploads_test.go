@@ -42,11 +42,32 @@ func doRaw(t *testing.T, app *App, method, target string, body []byte, contentTy
 	return rec
 }
 
+// initUpload performs a minimal init: every upload is a clip, so environmentId
+// and expiresAt are always present (only the "clip dressing" -- accessCode,
+// accessToken, maxDownloads -- is optional).
 func initUpload(t *testing.T, app *App, filename string, fileSize int64, mime, env string) map[string]interface{} {
 	t.Helper()
-	rec := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+	return initUploadBody(t, app, map[string]interface{}{
 		"filename": filename, "fileSize": fileSize, "mimeType": mime, "environmentId": env,
+		"expiresAt": futureTimestamp(2),
 	})
+}
+
+func initClipUpload(t *testing.T, app *App, filename string, fileSize int64, mime, env string, extra map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	body := map[string]interface{}{
+		"filename": filename, "fileSize": fileSize, "mimeType": mime, "environmentId": env,
+		"expiresAt": futureTimestamp(2),
+	}
+	for k, v := range extra {
+		body[k] = v
+	}
+	return initUploadBody(t, app, body)
+}
+
+func initUploadBody(t *testing.T, app *App, body map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	rec := do(t, app, http.MethodPost, "/api/uploads/init", body)
 	requireStatus(t, rec, http.StatusCreated)
 	return decode(t, rec)
 }
@@ -110,6 +131,7 @@ func TestUploadInitValidation(t *testing.T) {
 	// Too large -> 400 (needs Settings, not 422).
 	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "big.bin", "fileSize": app.Settings.MaxFileSizeBytes + 1,
+		"environmentId": "env-1", "expiresAt": futureTimestamp(1),
 	})
 	requireStatus(t, rec, http.StatusBadRequest)
 	if !strings.Contains(rec.Body.String(), "文件体积超过限制") {
@@ -119,6 +141,7 @@ func TestUploadInitValidation(t *testing.T) {
 	// Client knobs are ignored: server generates uploadId/chunkSize.
 	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "a.bin", "fileSize": 100, "chunkSize": 123, "uploadId": "hacked", "totalChunks": 99,
+		"environmentId": "env-1", "expiresAt": futureTimestamp(1),
 	})
 	requireStatus(t, rec, http.StatusCreated)
 	payload := decode(t, rec)
@@ -134,16 +157,105 @@ func TestUploadInitValidation(t *testing.T) {
 	if payload["totalChunks"] != float64(1) {
 		t.Fatalf("100 bytes in 64KiB chunks should be 1 chunk, got %v", payload["totalChunks"])
 	}
+
+	// Clip params are validated at init (not complete).
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "a.bin", "fileSize": 100, "environmentId": "env-1",
+		"expiresAt": -1,
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "a.bin", "fileSize": 100, "environmentId": "env-1",
+		"expiresAt": futureTimestamp(1), "accessCode": "ab-cd",
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "a.bin", "fileSize": 100, "expiresAt": futureTimestamp(1),
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "a.bin", "fileSize": 100, "environmentId": "env-1",
+		"expiresAt": 1, // past
+	})
+	requireStatus(t, rec, http.StatusBadRequest)
+	if !strings.Contains(rec.Body.String(), "过期时间必须晚于当前时间") {
+		t.Fatalf("past expiresAt should be rejected at init, got %s", rec.Body.String())
+	}
 }
 
-// TestFullChunkedUploadFileOnly covers init->chunks(out-of-order)->info->complete.
-func TestFullChunkedUploadFileOnly(t *testing.T) {
+// TestUploadInitRequiresEnvironmentID: a file clip without an owner is
+// unreachable (no accessCode/accessToken -> only the env owner can list it), so
+// init MUST refuse an upload that carries no environmentId.
+func TestUploadInitRequiresEnvironmentID(t *testing.T) {
+	app := newTestApp(t, smallChunkSettings())
+
+	// Key absent -> 422 and nothing persisted (no row, no chunk dir).
+	rec := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "ownerless.bin", "fileSize": 1000,
+		"mimeType": "application/octet-stream", "expiresAt": futureTimestamp(1),
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	if !strings.Contains(rec.Body.String(), "environmentId") {
+		t.Fatalf("error should mention environmentId, got %s", rec.Body.String())
+	}
+
+	// Blank/whitespace-only value -> 422 as well.
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "ownerless.bin", "fileSize": 1000, "environmentId": "   ",
+		"expiresAt": futureTimestamp(1),
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	if !strings.Contains(rec.Body.String(), "environmentId") {
+		t.Fatalf("blank environmentId should mention environmentId, got %s", rec.Body.String())
+	}
+
+	// Even with a valid accessCode / accessToken the owner is required.
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "ownerless.bin", "fileSize": 1000, "expiresAt": futureTimestamp(1),
+		"accessCode": "12345",
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	rec = do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "ownerless.bin", "fileSize": 1000, "expiresAt": futureTimestamp(1),
+		"accessToken": "tok-without-env",
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+
+	if sessions, _ := app.Repo.ListUploadSessions(); len(sessions) != 0 {
+		t.Fatalf("a refused init must not persist a session, got %v", sessions)
+	}
+	if dirs, _ := storage.ListUploadDirsOnDisk(app.Settings.FileStorageDir); len(dirs) != 0 {
+		t.Fatalf("a refused init must not create a chunk dir, got %v", dirs)
+	}
+}
+
+// TestUploadInitRequiresExpiresAt: expiresAt is a mandatory clip param (the
+// clips table stores NOT NULL expires_at), so it is rejected up-front instead of
+// failing after every chunk was uploaded.
+func TestUploadInitRequiresExpiresAt(t *testing.T) {
+	app := newTestApp(t, smallChunkSettings())
+	rec := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "no-expiry.bin", "fileSize": 1000, "environmentId": "env-noexp",
+	})
+	requireStatus(t, rec, http.StatusUnprocessableEntity)
+	if sessions, _ := app.Repo.ListUploadSessions(); len(sessions) != 0 {
+		t.Fatalf("a refused init must not persist a session, got %v", sessions)
+	}
+}
+
+// TestFullChunkedUploadCreatesNamelessClip covers
+// init->chunks(out-of-order)->info->complete for a NAMELESS clip: no
+// accessCode and no accessToken, so the clip is reachable only through its
+// environment owner. COMPLETE must still insert a clip (there is no
+// regular-file mode).
+func TestFullChunkedUploadCreatesNamelessClip(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	fileSize := chunkSize*2 + 12345
 	data := deterministicBytes(fileSize)
+	env := "env-nameless-full"
 
-	init := initUpload(t, app, "photo.png", int64(fileSize), "image/png", "env-1")
+	init := initUpload(t, app, "photo.png", int64(fileSize), "image/png", env)
 	uploadID := init["uploadId"].(string)
 	if int(init["totalChunks"].(float64)) != 3 {
 		t.Fatalf("expected 3 chunks, got %v", init["totalChunks"])
@@ -175,19 +287,27 @@ func TestFullChunkedUploadFileOnly(t *testing.T) {
 		t.Fatalf("expected missing-chunk detail, got %s", early.Body.String())
 	}
 
-	// Fill the gap and complete.
+	// Fill the gap and complete: the response is a FILE CLIP (201), never a
+	// plain "file-only" payload.
 	requireStatus(t, putChunk(t, app, uploadID, 1, sliceFor(chunkSize, data, 1)), http.StatusOK)
 	done := completeUpload(t, app, uploadID, nil)
-	requireStatus(t, done, http.StatusOK)
-	fileResp := decode(t, done)
-	if fileResp["status"] != "completed" {
-		t.Fatalf("unexpected complete body %v", fileResp)
+	requireStatus(t, done, http.StatusCreated)
+	clip := decode(t, done)
+	if clip["type"] != "file" {
+		t.Fatalf("complete must return a file clip, got %v", clip)
 	}
+	if clip["accessCode"] != nil || clip["accessToken"] != nil {
+		t.Fatalf("nameless clip must not expose access fields, got %v", clip)
+	}
+	clipID := clip["id"].(string)
 
 	// Assembled bytes must match exactly; chunk dir must be cleaned.
 	session, _ := app.Repo.GetUploadSession(uploadID)
 	if session == nil || session.StagedPath == "" {
 		t.Fatalf("session should record staged path: %+v", session)
+	}
+	if session.ClipID != clipID {
+		t.Fatalf("session must link the created clip, got %q want %q", session.ClipID, clipID)
 	}
 	assembled, err := os.ReadFile(session.StagedPath)
 	if err != nil {
@@ -200,11 +320,32 @@ func TestFullChunkedUploadFileOnly(t *testing.T) {
 		t.Fatalf("chunk dir should be removed after complete")
 	}
 
-	// Idempotent replay: second complete returns the same file info (no dup).
+	// The clip is listed for its environment owner (the only way a nameless
+	// clip can be discovered) and downloads byte-identically.
+	listed := decode(t, do(t, app, http.MethodGet, "/api/clips?environmentId="+env, nil))
+	items := listed["items"].([]interface{})
+	if len(items) != 1 {
+		t.Fatalf("expected the nameless clip in its environment list, got %v", listed)
+	}
+	dl := do(t, app, http.MethodGet, "/api/clips/"+clipID+"/file?environmentId="+env, nil)
+	requireStatus(t, dl, http.StatusOK)
+	if !bytes.Equal(dl.Body.Bytes(), data) {
+		t.Fatalf("download mismatch (got %d want %d)", dl.Body.Len(), len(data))
+	}
+	// Another environment cannot see it.
+	other := decode(t, do(t, app, http.MethodGet, "/api/clips?environmentId=env-someone-else", nil))
+	if len(other["items"].([]interface{})) != 0 {
+		t.Fatalf("foreign environment must not list the clip, got %v", other)
+	}
+
+	// Idempotent replay: second complete returns the same clip (no dup).
 	replay := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, replay, http.StatusOK)
-	if decode(t, replay)["uploadId"] != uploadID {
-		t.Fatalf("replay should return same upload: %s", replay.Body.String())
+	if decode(t, replay)["id"] != clipID {
+		t.Fatalf("replay should return same clip: %s", replay.Body.String())
+	}
+	if listedAfter := decode(t, do(t, app, http.MethodGet, "/api/clips?environmentId="+env, nil)); len(listedAfter["items"].([]interface{})) != 1 {
+		t.Fatalf("replay must not create a second clip: %v", listedAfter)
 	}
 
 	// GET on completed reports completed (not 404).
@@ -215,20 +356,51 @@ func TestFullChunkedUploadFileOnly(t *testing.T) {
 	}
 }
 
+// TestCompleteIgnoresClientParams: /complete carries no clip parameters; the
+// values frozen at init win even if an old client sends a conflicting body.
+func TestCompleteIgnoresClientParams(t *testing.T) {
+	app := newTestApp(t, smallChunkSettings())
+	env := "env-frozen"
+	data := deterministicBytes(4096)
+	init := initClipUpload(t, app, "frozen.bin", int64(len(data)), "application/octet-stream", env, map[string]interface{}{
+		"maxDownloads": 7, "accessCode": "24680",
+	})
+	uploadID := init["uploadId"].(string)
+	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
+
+	// A legacy-looking body (different code/expiry/env) must be ignored.
+	rec := completeUpload(t, app, uploadID, map[string]interface{}{
+		"environmentId": "env-hijack", "expiresAt": futureTimestamp(1),
+		"maxDownloads": 499, "accessCode": "13579",
+	})
+	requireStatus(t, rec, http.StatusCreated)
+	clip := decode(t, rec)
+	if clip["accessCode"] != "24680" {
+		t.Fatalf("clip must keep the init accessCode, got %v", clip)
+	}
+	if clip["maxDownloads"] != float64(7) {
+		t.Fatalf("clip must keep the init maxDownloads, got %v", clip["maxDownloads"])
+	}
+	session, _ := app.Repo.GetUploadSession(uploadID)
+	if session.EnvironmentID != env {
+		t.Fatalf("clip owner must come from init, got %q", session.EnvironmentID)
+	}
+}
+
 // TestCompleteWithClipCreation covers the clip-mode complete path end-to-end.
 func TestCompleteWithClipCreation(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 5000)
-	init := initUpload(t, app, "report.pdf", int64(len(data)), "application/pdf", "env-clip")
+	env := "env-clip"
+	init := initClipUpload(t, app, "report.pdf", int64(len(data)), "application/pdf", env, map[string]interface{}{
+		"maxDownloads": 5, "accessCode": "98765",
+	})
 	uploadID := init["uploadId"].(string)
 	for i := 0; i < 2; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
 	}
-	env := "env-clip"
-	clipRec := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": env, "expiresAt": futureTimestamp(2), "maxDownloads": 5, "accessCode": "98765",
-	})
+	clipRec := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, clipRec, http.StatusCreated)
 	clip := decode(t, clipRec)
 	if clip["type"] != "file" {
@@ -250,62 +422,92 @@ func TestCompleteWithClipCreation(t *testing.T) {
 	if session.Status != "completed" || session.ClipID != clipID {
 		t.Fatalf("session should link clip, got %+v", session)
 	}
-	// Replay with clip params returns the same clip (no duplicate creation).
-	replay := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": env, "expiresAt": futureTimestamp(2),
-	})
+	// Replay (empty complete body) returns the same clip (no duplicate creation).
+	replay := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, replay, http.StatusOK)
 	if decode(t, replay)["id"] != clipID {
 		t.Fatalf("replay should return same clip, got %s", replay.Body.String())
 	}
 }
 
-// TestCompleteDuplicateCodeRollback ensures clip failures preserve chunks.
-func TestCompleteDuplicateCodeRollback(t *testing.T) {
+// TestInitRejectsTakenAccessCode: a code already in clips is refused at init
+// so the client never uploads chunks that cannot become a clip.
+func TestInitRejectsTakenAccessCode(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
-	env := "env-dup"
-	// Occupy the short code via the legacy single-POST path.
+	env := "env-dup-init"
 	legacy := do(t, app, http.MethodPost, "/api/clips", map[string]interface{}{
 		"type": "text", "expiresAt": futureTimestamp(1), "environmentId": env,
 		"accessCode": "55555", "payload": map[string]interface{}{"text": "taken"},
 	})
 	requireStatus(t, legacy, http.StatusCreated)
 
-	data := deterministicBytes(1000)
-	init := initUpload(t, app, "dup.bin", int64(len(data)), "application/octet-stream", env)
-	uploadID := init["uploadId"].(string)
-	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
-
-	// Count files before: 0 staged files (only chunks).
-	beforeEntries, _ := os.ReadDir(app.Settings.FileStorageDir)
-
-	conflict := completeUpload(t, app, uploadID, map[string]interface{}{
+	rec := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
+		"filename": "dup.bin", "fileSize": 1000, "mimeType": "application/octet-stream",
 		"environmentId": env, "expiresAt": futureTimestamp(1), "accessCode": "55555",
 	})
+	requireStatus(t, rec, http.StatusConflict)
+	if !strings.Contains(rec.Body.String(), "直链码已存在") {
+		t.Fatalf("unexpected body %s", rec.Body.String())
+	}
+	if sessions, _ := app.Repo.ListUploadSessions(); len(sessions) != 0 {
+		t.Fatalf("failed init must not persist a session, got %v", sessions)
+	}
+}
+
+// TestCompleteDuplicateCodeRollback: two sessions capture the same unused
+// access code at init; the first complete wins, the second 409s and rolls back
+// (session stays active, chunks intact, no staged orphan).
+func TestCompleteDuplicateCodeRollback(t *testing.T) {
+	app := newTestApp(t, smallChunkSettings())
+	env := "env-dup"
+	data := deterministicBytes(1000)
+
+	init1 := initClipUpload(t, app, "dup1.bin", int64(len(data)), "application/octet-stream", env, map[string]interface{}{
+		"accessCode": "55555", "expiresAt": futureTimestamp(1),
+	})
+	init2 := initClipUpload(t, app, "dup2.bin", int64(len(data)), "application/octet-stream", env, map[string]interface{}{
+		"accessCode": "55555", "expiresAt": futureTimestamp(1),
+	})
+	id1 := init1["uploadId"].(string)
+	id2 := init2["uploadId"].(string)
+	requireStatus(t, putChunk(t, app, id1, 0, data), http.StatusOK)
+	requireStatus(t, putChunk(t, app, id2, 0, data), http.StatusOK)
+
+	first := completeUpload(t, app, id1, nil)
+	requireStatus(t, first, http.StatusCreated)
+
+	beforeEntries, _ := os.ReadDir(app.Settings.FileStorageDir)
+	beforeNames := map[string]bool{}
+	for _, e := range beforeEntries {
+		beforeNames[e.Name()] = true
+	}
+	conflict := completeUpload(t, app, id2, nil)
 	requireStatus(t, conflict, http.StatusConflict)
 	if !strings.Contains(conflict.Body.String(), "直链码已存在") {
 		t.Fatalf("unexpected body %s", conflict.Body.String())
 	}
 	// Rollback: session back to active, chunks intact, no staged orphan.
-	session, _ := app.Repo.GetUploadSession(uploadID)
+	session, _ := app.Repo.GetUploadSession(id2)
 	if session.Status != "active" {
 		t.Fatalf("session should roll back to active, got %s", session.Status)
 	}
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, uploadID, 0)); err != nil {
+	if session.StagedPath != "" {
+		t.Fatalf("rolled-back session must clear staged_path, got %q", session.StagedPath)
+	}
+	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, id2, 0)); err != nil {
 		t.Fatalf("chunk must survive rollback: %v", err)
 	}
 	afterEntries, _ := os.ReadDir(app.Settings.FileStorageDir)
-	// Only the uploads/ dir may exist; no new staged file in root.
 	for _, e := range afterEntries {
-		if !e.IsDir() {
-			t.Fatalf("staged orphan leaked: %s (before=%d after=%d)", e.Name(), len(beforeEntries), len(afterEntries))
+		if e.IsDir() || beforeNames[e.Name()] {
+			continue
 		}
+		t.Fatalf("staged orphan leaked: %s", e.Name())
 	}
-	// Retry with a fresh code succeeds (chunks reused, no re-upload).
-	retry := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": env, "expiresAt": futureTimestamp(1), "accessCode": "55556",
-	})
-	requireStatus(t, retry, http.StatusCreated)
+	// Retrying complete with the same stored code still conflicts (params are
+	// frozen at init); the session stays resumable/abortable.
+	again := completeUpload(t, app, id2, nil)
+	requireStatus(t, again, http.StatusConflict)
 }
 
 // TestChunkSizeValidation covers wrong-size / oversize / out-of-range.
@@ -313,7 +515,7 @@ func TestChunkSizeValidation(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 100)
-	init := initUpload(t, app, "s.bin", int64(len(data)), "application/octet-stream", "")
+	init := initUpload(t, app, "s.bin", int64(len(data)), "application/octet-stream", "env-chunk")
 	uploadID := init["uploadId"].(string)
 
 	// Undersize first chunk (must be exactly chunkSize).
@@ -365,12 +567,12 @@ func TestAbortAndCleanup(t *testing.T) {
 	requireStatus(t, del2, http.StatusNotFound)
 
 	// Completed-with-clip cannot be aborted.
-	init2 := initUpload(t, app, "c.bin", 10, "application/octet-stream", "env-abort")
+	init2 := initClipUpload(t, app, "c.bin", 10, "application/octet-stream", "env-abort", map[string]interface{}{
+		"expiresAt": futureTimestamp(1),
+	})
 	upload2 := init2["uploadId"].(string)
 	requireStatus(t, putChunk(t, app, upload2, 0, deterministicBytes(10)), http.StatusOK)
-	clipRec := completeUpload(t, app, upload2, map[string]interface{}{
-		"environmentId": "env-abort", "expiresAt": futureTimestamp(1),
-	})
+	clipRec := completeUpload(t, app, upload2, nil)
 	requireStatus(t, clipRec, http.StatusCreated)
 	del3 := do(t, app, http.MethodDelete, "/api/uploads/"+upload2, nil)
 	requireStatus(t, del3, http.StatusConflict)
@@ -380,7 +582,7 @@ func TestAbortAndCleanup(t *testing.T) {
 func TestExpiredSessionHandling(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	data := deterministicBytes(2000)
-	init := initUpload(t, app, "exp.bin", int64(len(data)), "application/octet-stream", "")
+	init := initUpload(t, app, "exp.bin", int64(len(data)), "application/octet-stream", "env-expired")
 	uploadID := init["uploadId"].(string)
 	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
 	// Force expiry.
@@ -406,7 +608,7 @@ func TestConcurrentChunkUploads(t *testing.T) {
 	totalChunks := 5
 	fileSize := chunkSize*(totalChunks-1) + 7777
 	data := deterministicBytes(fileSize)
-	init := initUpload(t, app, "conc.bin", int64(fileSize), "application/octet-stream", "")
+	init := initUpload(t, app, "conc.bin", int64(fileSize), "application/octet-stream", "env-conc")
 	uploadID := init["uploadId"].(string)
 
 	var wg sync.WaitGroup
@@ -427,8 +629,14 @@ func TestConcurrentChunkUploads(t *testing.T) {
 		t.Fatalf("concurrent PUT failed: %s", e)
 	}
 	done := completeUpload(t, app, uploadID, nil)
-	requireStatus(t, done, http.StatusOK)
+	requireStatus(t, done, http.StatusCreated)
+	if decode(t, done)["type"] != "file" {
+		t.Fatalf("complete must insert a file clip, got %s", done.Body.String())
+	}
 	session, _ := app.Repo.GetUploadSession(uploadID)
+	if session.ClipID == "" {
+		t.Fatalf("session must link its clip, got %+v", session)
+	}
 	assembled, _ := os.ReadFile(session.StagedPath)
 	if !bytes.Equal(assembled, data) {
 		t.Fatalf("concurrent assembly mismatch")
@@ -440,7 +648,7 @@ func TestCrashRecoveryResetStuck(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 11)
-	init := initUpload(t, app, "crash.bin", int64(len(data)), "application/octet-stream", "")
+	init := initUpload(t, app, "crash.bin", int64(len(data)), "application/octet-stream", "env-crash")
 	uploadID := init["uploadId"].(string)
 	for i := 0; i < 2; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
@@ -470,9 +678,12 @@ func TestCrashRecoveryResetStuck(t *testing.T) {
 	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, "orphan-no-row")); !os.IsNotExist(err) {
 		t.Fatalf("orphan dir should be swept")
 	}
-	// Chunks survived -> complete now succeeds.
+	// Chunks survived -> complete now succeeds and inserts the clip.
 	done := completeUpload(t, app, uploadID, nil)
-	requireStatus(t, done, http.StatusOK)
+	requireStatus(t, done, http.StatusCreated)
+	if decode(t, done)["type"] != "file" {
+		t.Fatalf("expected file clip after recovery, got %s", done.Body.String())
+	}
 	session2, _ := app.Repo.GetUploadSession(uploadID)
 	assembled, _ := os.ReadFile(session2.StagedPath)
 	if !bytes.Equal(assembled, data) {
@@ -485,7 +696,7 @@ func TestDiskLossReconcile(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize*2 + 100)
-	init := initUpload(t, app, "loss.bin", int64(len(data)), "application/octet-stream", "")
+	init := initUpload(t, app, "loss.bin", int64(len(data)), "application/octet-stream", "env-loss")
 	uploadID := init["uploadId"].(string)
 	for i := 0; i < 3; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
@@ -517,15 +728,17 @@ func TestDiskLossReconcile(t *testing.T) {
 	if _, ok := raw["missing"]; !ok {
 		t.Fatalf("complete should include missing list, got %v", raw)
 	}
-	// Re-upload the lost chunk -> complete succeeds.
+	// Re-upload the lost chunk -> complete succeeds (clip created).
 	requireStatus(t, putChunk(t, app, uploadID, 1, sliceFor(chunkSize, data, 1)), http.StatusOK)
-	requireStatus(t, completeUpload(t, app, uploadID, nil), http.StatusOK)
+	requireStatus(t, completeUpload(t, app, uploadID, nil), http.StatusCreated)
 }
 
 // TestEmptyFileUpload covers 0-byte files (0 chunks, direct complete).
 func TestEmptyFileUpload(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
-	init := initUpload(t, app, "empty.txt", 0, "text/plain", "env-empty")
+	init := initClipUpload(t, app, "empty.txt", 0, "text/plain", "env-empty", map[string]interface{}{
+		"expiresAt": futureTimestamp(1),
+	})
 	uploadID := init["uploadId"].(string)
 	if init["totalChunks"] != float64(0) {
 		t.Fatalf("empty file should have 0 chunks, got %v", init["totalChunks"])
@@ -533,9 +746,7 @@ func TestEmptyFileUpload(t *testing.T) {
 	if rec := putChunk(t, app, uploadID, 0, []byte{}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("PUT on empty session should 400, got %d", rec.Code)
 	}
-	done := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": "env-empty", "expiresAt": futureTimestamp(1),
-	})
+	done := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, done, http.StatusCreated)
 	clip := decode(t, done)
 	size := clip["payload"].(map[string]interface{})["file"].(map[string]interface{})["size"]
@@ -574,6 +785,7 @@ func TestCaptchaVerifiedAtInit(t *testing.T) {
 	// 1) init without captcha -> 400, NOTHING persisted (no row, no dir).
 	bad := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "cap.bin", "fileSize": 1500, "environmentId": "env-cap",
+		"expiresAt": futureTimestamp(1),
 	})
 	requireStatus(t, bad, http.StatusBadRequest)
 	if !strings.Contains(bad.Body.String(), "缺少验证码") {
@@ -588,19 +800,18 @@ func TestCaptchaVerifiedAtInit(t *testing.T) {
 		t.Fatalf("no session row may exist after failed init, got %v", sessions)
 	}
 
-	// 2) init with captcha -> 201, chunks accepted, complete needs NO captcha.
+	// 2) init with captcha -> 201, chunks accepted, complete needs NO captcha
+	// and no clip fields (they were captured at init).
 	good := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "cap.bin", "fileSize": 1500, "environmentId": "env-cap",
+		"expiresAt":    futureTimestamp(1),
 		"captchaToken": "pass-me", "captchaProvider": "turnstile",
 	})
 	requireStatus(t, good, http.StatusCreated)
 	uploadID := decode(t, good)["uploadId"].(string)
 	data := deterministicBytes(1500)
 	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
-	// complete without captcha fields succeeds (captcha was init-time).
-	done := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": "env-cap", "expiresAt": futureTimestamp(1),
-	})
+	done := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, done, http.StatusCreated)
 	if decode(t, done)["type"] != "file" {
 		t.Fatalf("expected file clip, got %s", done.Body.String())
@@ -619,6 +830,7 @@ func TestInitIdempotentReplay_ReturnsSameSession(t *testing.T) {
 	})
 	first := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "idem.bin", "fileSize": 200000, "environmentId": "env-idem",
+		"expiresAt": futureTimestamp(2),
 		"requestId": "req-42", "captchaToken": "pass-me", "captchaProvider": "turnstile",
 	})
 	requireStatus(t, first, http.StatusCreated)
@@ -628,6 +840,7 @@ func TestInitIdempotentReplay_ReturnsSameSession(t *testing.T) {
 	requireStatus(t, putChunk(t, app, a, 0, deterministicBytes(64<<10)), http.StatusOK)
 	replay := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "idem.bin", "fileSize": 200000, "environmentId": "env-idem",
+		"expiresAt": futureTimestamp(2),
 		"requestId": "req-42",
 	})
 	requireStatus(t, replay, http.StatusOK)
@@ -652,6 +865,7 @@ func TestInitIdempotentReplay_ReturnsSameSession(t *testing.T) {
 	// A DIFFERENT requestId creates a NEW session.
 	other := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "idem.bin", "fileSize": 200000, "environmentId": "env-idem",
+		"expiresAt": futureTimestamp(2),
 		"requestId": "req-43", "captchaToken": "pass-me", "captchaProvider": "turnstile",
 	})
 	requireStatus(t, other, http.StatusCreated)
@@ -661,6 +875,7 @@ func TestInitIdempotentReplay_ReturnsSameSession(t *testing.T) {
 	// An init WITHOUT requestId also creates a distinct session (no dedup).
 	third := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "idem.bin", "fileSize": 200000, "environmentId": "env-idem",
+		"expiresAt":    futureTimestamp(2),
 		"captchaToken": "pass-me", "captchaProvider": "turnstile",
 	})
 	requireStatus(t, third, http.StatusCreated)
@@ -675,6 +890,7 @@ func TestInitExpiredRequestId(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	first := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "old.bin", "fileSize": 100, "environmentId": "env-exp",
+		"expiresAt": futureTimestamp(2),
 		"requestId": "req-old",
 	})
 	requireStatus(t, first, http.StatusCreated)
@@ -687,6 +903,7 @@ func TestInitExpiredRequestId(t *testing.T) {
 	// is only for live replays; expired ones create fresh -> 201).
 	second := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 		"filename": "old.bin", "fileSize": 100, "environmentId": "env-exp",
+		"expiresAt": futureTimestamp(2),
 		"requestId": "req-old",
 	})
 	if second.Code != http.StatusCreated {
@@ -718,6 +935,7 @@ func TestInitConcurrentSameRequestId(t *testing.T) {
 			defer wg.Done()
 			rec := do(t, app, http.MethodPost, "/api/uploads/init", map[string]interface{}{
 				"filename": "race.bin", "fileSize": 4096, "environmentId": "env-race",
+				"expiresAt": futureTimestamp(2),
 				"requestId": "req-race",
 			})
 			if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {

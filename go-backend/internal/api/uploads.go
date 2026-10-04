@@ -279,10 +279,41 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Clip-param business rules (format already enforced by ParseUploadInitRequest)
+	// run before captcha/quota so a bad expiresAt never consumes storage.
+	// Every upload becomes a clip, so they always apply; idempotent replays above
+	// skip them so a live session is returned as-is.
+	if !time.UnixMilli(req.ExpiresAt).UTC().After(time.Now().UTC()) {
+		writeError(w, newHTTPError(http.StatusBadRequest, "过期时间必须晚于当前时间"))
+		return
+	}
+
 	// Captcha gate: verified once, up-front, before any chunk can be stored.
 	// Turnstile tokens are single-use & short-lived, so they belong at init.
 	if !a.verifyCaptcha(w, r, req.CaptchaToken, req.CaptchaProvider) {
 		return
+	}
+
+	// Clip business rules (token ownership, access-code uniqueness against
+	// already-inserted clips) run after captcha and BEFORE quota reservation
+	// so a doomed init never consumes storage. Concurrent inits with the same
+	// unused code can still race at complete; that path rolls back.
+	if req.AccessToken != nil && *req.AccessToken != "" {
+		if err := a.ensureAccessTokenOwner(*req.AccessToken, req.EnvironmentID); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	if req.AccessCode != nil && *req.AccessCode != "" {
+		existing, err := a.Repo.GetClipByCode(*req.AccessCode)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if existing != nil {
+			writeError(w, newHTTPError(http.StatusConflict, "直链码已存在，请刷新后再试"))
+			return
+		}
 	}
 
 	// ---- Global storage gates. Fixed order: live-session cap, then quota
@@ -332,6 +363,9 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		Filename: req.Filename, FileSize: req.FileSize, MimeType: req.MimeType,
 		EnvironmentID: req.EnvironmentID, RequestID: req.RequestID,
 		ChunkSize: chunkSize, TTLSeconds: ttl,
+		ClipExpiresAt:    req.ExpiresAt,
+		ClipMaxDownloads: req.MaxDownloads, ClipAccessCode: req.AccessCode,
+		ClipAccessToken: req.AccessToken,
 	})
 	if err != nil {
 		releaseReservation()
@@ -548,8 +582,9 @@ func (a *App) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// Files outside the lock. Completed-with-clip is rejected above, so a
-	// staged path here is always safe to delete (file-only session).
+	// Files outside the lock. A completed session (which always owns a clip) is
+	// rejected above, so a staged path here belongs to an aborted upload and is
+	// always safe to delete.
 	_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, uploadID)
 	if session.StagedPath != "" && session.ClipID == "" {
 		_ = os.Remove(session.StagedPath)
@@ -561,21 +596,24 @@ func (a *App) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, schemas.DeleteResponse{OK: true})
 }
 
-// POST /api/uploads/{id}/complete -- assemble (+ optionally create clip).
+// POST /api/uploads/{id}/complete -- assemble the chunk stream and insert the
+// file clip.
+//
+// The clip parameters are NOT accepted here: they were validated at init and
+// frozen on the session row, so a client cannot bypass validation by sending
+// different (or missing) params at complete time, and a retried complete cannot
+// create a clip with different access rules than the session was booked with.
+// There is no file-only mode: every session ends in a clip row.
 func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := strings.TrimSpace(uploadIDFromRequest(r))
 	if uploadID == "" {
 		writeError(w, newHTTPError(http.StatusNotFound, "上传会话不存在"))
 		return
 	}
-	body, err := readBody(r)
-	if err != nil {
+	// Drain any leftover body: complete carries no parameters (older clients may
+	// still send a JSON object; it is ignored, never trusted).
+	if _, err := readBody(r); err != nil {
 		writeError(w, err)
-		return
-	}
-	clipParams, validationError := schemas.ParseUploadCompleteRequest(body)
-	if validationError != nil {
-		writeError(w, validationError)
 		return
 	}
 
@@ -604,15 +642,12 @@ func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Clip-mode pre-validation BEFORE touching upload state or doing assembly
-	// IO: token ownership (short DB) and field sanity. Failures here leave
-	// chunks intact for retry with corrected params. Note: captcha was already
-	// verified at init (before any disk was consumed), so it is NOT repeated
-	// here — Turnstile tokens are single-use and would fail the second time.
-	if clipParams.HasClipFields {
-		if proceed := a.preValidateCompleteClip(w, r, session, clipParams); !proceed {
-			return
-		}
+	// Pre-validation of the session-frozen clip params BEFORE touching upload
+	// state or doing assembly IO: environment + expiry + token ownership (short
+	// DB reads). Failures here leave the chunks intact and resumable. Captcha
+	// and the clip field format were already verified at init.
+	if proceed := a.preValidateCompleteClip(w, r, session); !proceed {
+		return
 	}
 
 	// Reserve the final path and flip active->completing atomically (short lock).
@@ -658,75 +693,56 @@ func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Assembly succeeded. Clip mode: create the clip (short DB); on failure
-	// delete the assembled file (rollback) and flip back to active.
-	if clipParams.HasClipFields {
-		clip, err := a.createClipFromCompletedUpload(session, completing, clipParams)
-		if err != nil {
-			// Rollback: staged file is orphan (no clip owns it) -> delete.
-			_ = os.Remove(completing.StagedPath)
-			if staged, _ := a.Repo.FailComplete(uploadID); staged != "" && staged != completing.StagedPath {
-				_ = os.Remove(staged)
-			}
-			a.writeClipCreationError(w, err)
-			return
+	// Assembly succeeded. The ONLY way to finish an upload is to insert the clip
+	// from the params frozen at init. Concurrent completes can still collide
+	// (an accessCode claimed since init, a token owner changed, the expiry that
+	// passed while uploading): such a failure must not leave a half-finished
+	// upload behind, so the session is rolled back to active -- staged file
+	// deleted, chunk receipts kept so the client can resume or abort -- and the
+	// typed error (409 conflict / 400 value error) is surfaced.
+	clip, err := a.createClipFromCompletedUpload(session, completing)
+	if err != nil {
+		// Rollback: the staged file is orphan (no clip owns it) -> delete.
+		_ = os.Remove(completing.StagedPath)
+		if staged, _ := a.Repo.FailComplete(uploadID); staged != "" && staged != completing.StagedPath {
+			_ = os.Remove(staged)
 		}
-		completed, err := a.Repo.CompleteUploadSession(uploadID, clip.ID)
-		if err != nil {
-			// Extremely rare: session was aborted/expired between assembly and
-			// commit. The clip already exists (do NOT delete user data); just
-			// surface success via the clip (session row is gone, cannot record).
-			a.logger.Printf("ERROR:    complete commit raced abort for %s (clip %s kept): %v", uploadID, clip.ID, err)
-			writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
-			return
-		}
-		_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, uploadID)
-		_ = completed
+		a.writeClipCreationError(w, err)
+		return
+	}
+	completed, err := a.Repo.CompleteUploadSession(uploadID, clip.ID)
+	if err != nil {
+		// Extremely rare: session was aborted/expired between assembly and
+		// commit. The clip already exists (do NOT delete user data); just
+		// surface success via the clip (session row is gone, cannot record).
+		a.logger.Printf("ERROR:    complete commit raced abort for %s (clip %s kept): %v", uploadID, clip.ID, err)
 		writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 		return
 	}
-
-	// File-only mode: mark completed (staged file owned by the session until TTL).
-	completed, err := a.Repo.CompleteUploadSession(uploadID, "")
-	if err != nil {
-		_ = os.Remove(completing.StagedPath)
-		a.logger.Printf("ERROR:    unable to commit completed upload %s: %v", uploadID, err)
-		writeError(w, newHTTPError(http.StatusInternalServerError, "文件合并失败，请重试"))
-		return
-	}
 	_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, uploadID)
-	resp := schemas.UploadCompleteFileResponse{
-		UploadID: completed.ID, Status: completed.Status, ExpiresAt: toMillis(completed.ExpiresAt),
-	}
-	resp.File.Name = completed.Filename
-	resp.File.Size = completed.FileSize
-	resp.File.Type = completed.MimeType
-	writeJSON(w, http.StatusOK, resp)
+	_ = completed
+	writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 }
 
 // replayCompletedUpload renders the idempotent result of an already-completed
 // session (retry after lost response).
 func (a *App) replayCompletedUpload(w http.ResponseWriter, r *http.Request, session *repository.UploadSession) {
-	if session.ClipID != "" {
-		clip, err := a.Repo.GetClip(session.ClipID)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		if clip == nil {
-			writeError(w, newHTTPError(http.StatusGone, "文件已过期或销毁"))
-			return
-		}
-		writeJSON(w, http.StatusOK, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
+	// A completed session always links its clip; only rows written before the
+	// clip-only model can miss it, and those cannot be replayed as a clip.
+	if session.ClipID == "" {
+		writeError(w, newHTTPError(http.StatusGone, "上传记录已失效，请重新上传"))
 		return
 	}
-	resp := schemas.UploadCompleteFileResponse{
-		UploadID: session.ID, Status: session.Status, ExpiresAt: toMillis(session.ExpiresAt),
+	clip, err := a.Repo.GetClip(session.ClipID)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
-	resp.File.Name = session.Filename
-	resp.File.Size = session.FileSize
-	resp.File.Type = session.MimeType
-	writeJSON(w, http.StatusOK, resp)
+	if clip == nil {
+		writeError(w, newHTTPError(http.StatusGone, "文件已过期或销毁"))
+		return
+	}
+	writeJSON(w, http.StatusOK, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 }
 
 func (a *App) writeCompleteTransitionError(w http.ResponseWriter, err error) {
@@ -815,16 +831,25 @@ func (a *App) assembleSessionFiles(session *repository.UploadSession, completing
 	return nil
 }
 
-// preValidateCompleteClip mirrors handleCreateClip's token gate (captcha gate
-// moved to init). Runs before assembly so failures never burn a merge.
-func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, session *repository.UploadSession, params *schemas.UploadCompleteClipParams) bool {
-	envID := strings.TrimSpace(params.EnvironmentID)
+// preValidateCompleteClip re-checks the session-frozen clip params (owner,
+// expiry, token ownership) before any assembly IO, so a doomed complete never
+// burns a merge.
+func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, session *repository.UploadSession) bool {
+	// init requires environmentId, so these two guards only fire for rows
+	// written by a pre-upgrade version. Such a session has no owner and no clip
+	// params, i.e. it can never become a (reachable) clip -> ask for a re-upload
+	// instead of silently producing an unreachable file.
+	envID := strings.TrimSpace(session.EnvironmentID)
 	if envID == "" {
-		writeError(w, newHTTPError(http.StatusBadRequest, "缺少 environmentId"))
+		writeError(w, newHTTPError(http.StatusBadRequest, "上传会话缺少 environmentId，请重新上传"))
 		return false
 	}
-	if params.AccessToken != nil && *params.AccessToken != "" {
-		if err := a.ensureAccessTokenOwner(*params.AccessToken, envID); err != nil {
+	if session.ClipExpiresAt <= 0 {
+		writeError(w, newHTTPError(http.StatusBadRequest, "上传会话缺少片段参数，请重新上传"))
+		return false
+	}
+	if session.ClipAccessToken != nil && *session.ClipAccessToken != "" {
+		if err := a.ensureAccessTokenOwner(*session.ClipAccessToken, envID); err != nil {
 			writeError(w, err)
 			return false
 		}
@@ -832,19 +857,34 @@ func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, se
 	return true
 }
 
-// createClipFromCompletedUpload persists the clip row referencing the staged file.
-func (a *App) createClipFromCompletedUpload(session *repository.UploadSession, completing *repository.UploadSession, params *schemas.UploadCompleteClipParams) (*models.Clip, error) {
+// createClipFromCompletedUpload inserts the file clip referencing the staged
+// file, using the params captured on the session at init. There is no
+// "file-only" alternative: this is the only success path of COMPLETE.
+//
+// It re-checks the invariants that a concurrent upload can break while this
+// session was streaming chunks:
+//   - a token that was re-registered to another environment -> token occupied;
+//   - an accessCode that another completer took  -> 409 conflict (handled
+//     atomically by CreateClip through the UNIQUE index on clips.access_code);
+//   - an expiry that elapsed during the upload   -> value error (400).
+//
+// Callers must roll the session back (FailComplete) on error and delete the
+// orphan staged file.
+func (a *App) createClipFromCompletedUpload(session *repository.UploadSession, completing *repository.UploadSession) (*models.Clip, error) {
 	stored := &models.StoredFile{
 		Name: session.Filename, Size: session.FileSize, Mime: session.MimeType, Path: completing.StagedPath,
 	}
 	if stored.Size > a.Settings.MaxFileSizeBytes {
 		return nil, newHTTPError(http.StatusBadRequest, "文件体积超过限制")
 	}
-	envID := strings.TrimSpace(params.EnvironmentID)
+	envID := strings.TrimSpace(session.EnvironmentID)
+	if envID == "" {
+		return nil, newHTTPError(http.StatusBadRequest, "上传会话缺少 environmentId，请重新上传")
+	}
 	return a.Repo.CreateClip(repository.CreateClipParams{
-		ClipType: models.ClipTypeFile, ExpiresAtMs: params.ExpiresAt,
-		MaxDownloads: params.MaxDownloads, AccessCode: params.AccessCode,
-		AccessToken: params.AccessToken, EnvironmentID: envID, StoredFile: stored,
+		ClipType: models.ClipTypeFile, ExpiresAtMs: session.ClipExpiresAt,
+		MaxDownloads: session.ClipMaxDownloads, AccessCode: session.ClipAccessCode,
+		AccessToken: session.ClipAccessToken, EnvironmentID: envID, StoredFile: stored,
 	})
 }
 

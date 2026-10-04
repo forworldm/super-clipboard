@@ -1,10 +1,10 @@
 import {
   abortFileUpload,
-  completeUploadAsClip,
+  completeUpload,
   getUploadInfo,
   initFileUpload,
   uploadChunkBytes,
-  type UploadCompleteClipParams,
+  type UploadClipParams,
   type UploadInfoResponse
 } from "./api";
 import type { RemoteClip } from "../store/useClipboardStore";
@@ -167,8 +167,11 @@ export type UploadProgress = {
 export type ChunkedUploadOptions = {
   file: File;
   filename?: string;
-  environmentId: string;
-  clip: UploadCompleteClipParams;
+  // Every upload is a file clip: the params (environmentId + expiresAt, plus
+  // optional maxDownloads/accessCode/accessToken) travel with INIT, are
+  // validated before any chunk consumes storage and are stored on the session.
+  // /complete replays them and never accepts them again.
+  clip: UploadClipParams;
   // Captcha is verified once at INIT (before any chunk consumes storage).
   captchaToken?: string;
   captchaProvider?: "turnstile" | "recaptcha";
@@ -225,7 +228,6 @@ export const uploadFileChunked = async (
 ): Promise<RemoteClip> => {
   const {
     file,
-    environmentId,
     clip,
     concurrency = 3,
     chunkTimeoutMs = 30_000,
@@ -234,6 +236,15 @@ export const uploadFileChunked = async (
     signal,
     onProgress
   } = options;
+  const environmentId = (clip.environmentId ?? "").trim();
+  if (!environmentId) {
+    // The server rejects an ownerless upload (a nameless clip without an
+    // environment could never be listed again), so fail early & clearly.
+    throw new Error("environmentId 缺失，无法创建文件片段");
+  }
+  if (!Number.isFinite(clip.expiresAt) || clip.expiresAt <= Date.now()) {
+    throw new Error("过期时间必须晚于当前时间");
+  }
   const filename = (options.filename ?? file.name ?? "").trim() || "uploaded";
   const mimeType = file.type || "application/octet-stream";
   const totalBytes = file.size;
@@ -309,7 +320,12 @@ export const uploadFileChunked = async (
       environmentId,
       requestId,
       captchaToken: options.captchaToken,
-      captchaProvider: options.captchaProvider
+      captchaProvider: options.captchaProvider,
+      // Clip params: validated + persisted server-side at init.
+      expiresAt: clip.expiresAt,
+      maxDownloads: clip.maxDownloads,
+      accessCode: clip.accessCode,
+      accessToken: clip.accessToken
     });
     uploadId = init.uploadId;
     chunkSize = init.chunkSize;
@@ -349,11 +365,9 @@ export const uploadFileChunked = async (
     }
     const completeTimer = window.setTimeout(() => completeCtrl.abort(), completeTimeoutMs);
     try {
-      return await completeUploadAsClip(
-        uploadId as string,
-        { ...clip, environmentId },
-        { signal: completeCtrl.signal }
-      );
+      return await completeUpload(uploadId as string, {
+        signal: completeCtrl.signal
+      });
     } finally {
       window.clearTimeout(completeTimer);
       signal?.removeEventListener("abort", onParentAbort);
@@ -562,7 +576,7 @@ export const uploadFileChunked = async (
     throw failed;
   }
 
-  // -- Phase 3: complete (assemble + create clip) ----------------------------
+  // -- Phase 3: complete (assemble + insert the file clip, no params) --------
   emit({
     uploadId,
     uploadedBytes: totalBytes,

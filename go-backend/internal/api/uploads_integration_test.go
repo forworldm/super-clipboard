@@ -66,7 +66,9 @@ func TestResumeAcrossServerRestart(t *testing.T) {
 	app1, repo1 := newTestAppOnDir(t, dir, nil)
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 12345)
-	init := initUpload(t, app1, "restart.bin", int64(len(data)), "application/octet-stream", "env-rs")
+	init := initClipUpload(t, app1, "restart.bin", int64(len(data)), "application/octet-stream", "env-rs", map[string]interface{}{
+		"expiresAt": futureTimestamp(2), "maxDownloads": 3,
+	})
 	uploadID := init["uploadId"].(string)
 	if int(init["totalChunks"].(float64)) != 2 {
 		t.Fatalf("expected 2 chunks, got %v", init["totalChunks"])
@@ -101,9 +103,7 @@ func TestResumeAcrossServerRestart(t *testing.T) {
 	// Idempotent init replay (same requestId was never used here, so a fresh
 	// init would create a NEW session — resume continues on the existing one).
 	requireStatus(t, putChunk(t, app2, uploadID, 1, sliceFor(chunkSize, data, 1)), http.StatusOK)
-	done := completeUpload(t, app2, uploadID, map[string]interface{}{
-		"environmentId": "env-rs", "expiresAt": futureTimestamp(2), "maxDownloads": 3,
-	})
+	done := completeUpload(t, app2, uploadID, nil)
 	requireStatus(t, done, http.StatusCreated)
 	clip := decode(t, done)
 	clipID := clip["id"].(string)
@@ -120,9 +120,7 @@ func TestResumeAcrossServerRestart(t *testing.T) {
 		t.Fatalf("expected exactly one clip, got %v", listed)
 	}
 	// Idempotent complete replay after restart returns the same clip.
-	replay := completeUpload(t, app2, uploadID, map[string]interface{}{
-		"environmentId": "env-rs", "expiresAt": futureTimestamp(2),
-	})
+	replay := completeUpload(t, app2, uploadID, nil)
 	requireStatus(t, replay, http.StatusOK)
 	if decode(t, replay)["id"] != clipID {
 		t.Fatalf("replay returned a different clip: %s", replay.Body.String())
@@ -175,7 +173,10 @@ func TestChunkedTransferOverflowIs413NoDisk(t *testing.T) {
 	// Session still usable: resend the correct chunk size and complete.
 	requireStatus(t, putChunk(t, app, uploadID, 0, deterministicBytes(chunkSize)), http.StatusOK)
 	done := completeUpload(t, app, uploadID, nil)
-	requireStatus(t, done, http.StatusOK)
+	requireStatus(t, done, http.StatusCreated)
+	if decode(t, done)["type"] != "file" {
+		t.Fatalf("complete must insert a file clip, got %s", done.Body.String())
+	}
 }
 
 // TestContentLengthMismatch: a lying Content-Length must never pollute the
@@ -213,7 +214,7 @@ func TestContentLengthMismatch(t *testing.T) {
 	}
 	// Retry with the honest body size succeeds.
 	requireStatus(t, putChunk(t, app, u1, 0, deterministicBytes(chunkSize)), http.StatusOK)
-	requireStatus(t, completeUpload(t, app, u1, nil), http.StatusOK)
+	requireStatus(t, completeUpload(t, app, u1, nil), http.StatusCreated)
 
 	// Case 2: declared < actual. Overflow is still caught by the streaming
 	// limit -> 413, no file, no receipt.
@@ -234,7 +235,7 @@ func TestContentLengthMismatch(t *testing.T) {
 	}
 	// Honest retry works.
 	requireStatus(t, putChunk(t, app, u2, 0, deterministicBytes(chunkSize)), http.StatusOK)
-	requireStatus(t, completeUpload(t, app, u2, nil), http.StatusOK)
+	requireStatus(t, completeUpload(t, app, u2, nil), http.StatusCreated)
 }
 
 // TestConcurrentCompleteExactlyOnce: N clients POST /complete on the same
@@ -249,7 +250,9 @@ func TestConcurrentCompleteExactlyOnce(t *testing.T) {
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 4242)
 
-	init := initUpload(t, app, "race-complete.bin", int64(len(data)), "application/octet-stream", "env-rc")
+	init := initClipUpload(t, app, "race-complete.bin", int64(len(data)), "application/octet-stream", "env-rc", map[string]interface{}{
+		"expiresAt": futureTimestamp(2), "maxDownloads": 5,
+	})
 	uploadID := init["uploadId"].(string)
 	for i := 0; i < 2; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
@@ -268,9 +271,7 @@ func TestConcurrentCompleteExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-barrier
-			rec := completeUpload(t, app, uploadID, map[string]interface{}{
-				"environmentId": "env-rc", "expiresAt": futureTimestamp(2), "maxDownloads": 5,
-			})
+			rec := completeUpload(t, app, uploadID, nil)
 			results <- outcome{code: rec.Code, body: decode(t, rec)}
 		}()
 	}
@@ -322,9 +323,7 @@ func TestConcurrentCompleteExactlyOnce(t *testing.T) {
 		}
 	}
 	// A further complete is a pure idempotent replay.
-	final := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": "env-rc", "expiresAt": futureTimestamp(2),
-	})
+	final := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, final, http.StatusOK)
 	if decode(t, final)["id"] != s.ClipID {
 		t.Fatalf("post-race replay must serve the stored clip")
@@ -349,7 +348,9 @@ func TestConcurrentDeleteVsComplete(t *testing.T) {
 		env := fmt.Sprintf("env-rd-%d", round)
 		data := deterministicBytes(chunkSize + 777 + round)
 		initUploadID := func() string {
-			rec := initUpload(t, app, fmt.Sprintf("rd-%d.bin", round), int64(len(data)), "application/octet-stream", env)
+			rec := initClipUpload(t, app, fmt.Sprintf("rd-%d.bin", round), int64(len(data)), "application/octet-stream", env, map[string]interface{}{
+				"expiresAt": futureTimestamp(1),
+			})
 			return rec["uploadId"].(string)
 		}
 		uploadID := initUploadID()
@@ -365,9 +366,7 @@ func TestConcurrentDeleteVsComplete(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-barrier
-			completeResult <- completeUpload(t, app, uploadID, map[string]interface{}{
-				"environmentId": env, "expiresAt": futureTimestamp(1),
-			})
+			completeResult <- completeUpload(t, app, uploadID, nil)
 		}()
 		go func() {
 			defer wg.Done()
@@ -454,14 +453,14 @@ func TestCompleteIdempotencyAfterLostResponse(t *testing.T) {
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize + 999)
 
-	init := initUpload(t, app, "lost-resp.bin", int64(len(data)), "application/octet-stream", "env-lr")
+	init := initClipUpload(t, app, "lost-resp.bin", int64(len(data)), "application/octet-stream", "env-lr", map[string]interface{}{
+		"expiresAt": futureTimestamp(1),
+	})
 	uploadID := init["uploadId"].(string)
 	for i := 0; i < 2; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
 	}
-	first := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": "env-lr", "expiresAt": futureTimestamp(1),
-	})
+	first := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, first, http.StatusCreated)
 	clipID := decode(t, first)["id"].(string)
 
@@ -471,9 +470,7 @@ func TestCompleteIdempotencyAfterLostResponse(t *testing.T) {
 	if info["status"] != "completed" {
 		t.Fatalf("GET should report completed, got %v", info)
 	}
-	second := completeUpload(t, app, uploadID, map[string]interface{}{
-		"environmentId": "env-lr", "expiresAt": futureTimestamp(1),
-	})
+	second := completeUpload(t, app, uploadID, nil)
 	requireStatus(t, second, http.StatusOK)
 	if decode(t, second)["id"] != clipID {
 		t.Fatalf("replay must return the original clip %s", clipID)

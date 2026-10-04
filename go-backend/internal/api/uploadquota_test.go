@@ -41,6 +41,8 @@ func initRaw(t *testing.T, app *App, filename string, fileSize int64, env, reque
 	body := map[string]interface{}{
 		"filename": filename, "fileSize": fileSize,
 		"mimeType": "application/octet-stream", "environmentId": env,
+		// Every upload is a clip: expiresAt is part of the init contract.
+		"expiresAt": futureTimestamp(2),
 	}
 	if requestID != "" {
 		body["requestId"] = requestID
@@ -308,7 +310,11 @@ func TestQuotaReleasedOnAbortCompleteAndExpiry(t *testing.T) {
 		payload := initUpload(t, app, "done.bin", 800, "application/octet-stream", "env-c")
 		uploadID, _ := payload["uploadId"].(string)
 		requireStatus(t, putChunk(t, app, uploadID, 0, deterministicBytes(800)), http.StatusOK)
-		requireStatus(t, completeUpload(t, app, uploadID, nil), http.StatusOK)
+		done := completeUpload(t, app, uploadID, nil)
+		requireStatus(t, done, http.StatusCreated)
+		if decode(t, done)["type"] != "file" {
+			t.Fatalf("complete must insert a file clip, got %s", done.Body.String())
+		}
 		if got := reservedValue(t, app); got != 0 {
 			t.Fatalf("reserved = %d after complete, want 0", got)
 		}
@@ -434,5 +440,3 @@ func TestStorageGuardsAnswerDistinct507(t *testing.T) {
 		})
 	}
 }
-
-

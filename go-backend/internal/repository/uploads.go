@@ -54,11 +54,18 @@ type UploadSession struct {
 	UpdatedAt     int64  // unix seconds
 	ExpiresAt     int64  // unix seconds
 	StagedPath    string // final assembled file (set when completing/completed)
-	ClipID        string // clip created by complete (empty for file-only sessions)
+	ClipID        string // clip inserted by complete (empty only mid-upload)
 	// QuotaReleased reports whether this session already returned its upload
 	// quota reservation. The flag + a CAS UPDATE makes release idempotent:
 	// abort/expire/complete can race, only one of them decrements the ledger.
 	QuotaReleased bool
+	// Clip params captured at init and turned into a row of `clips` by COMPLETE.
+	// They are mandatory now (every upload is a clip), so a live session always
+	// carries ClipExpiresAt; 0 only survives on rows written by older versions.
+	ClipExpiresAt    int64
+	ClipMaxDownloads *int
+	ClipAccessCode   *string
+	ClipAccessToken  *string
 }
 
 // IsExpired reports whether the session passed its TTL.
@@ -125,35 +132,65 @@ func scanUploadSession(scan func(dest ...interface{}) error) (*UploadSession, er
 		createdAt, updatedAt, expiresAt int64
 		stagedPath, clipID, requestID   sql.NullString
 		quotaReleased                   int
+		clipExpiresAt                   sql.NullInt64
+		clipMaxDownloads                sql.NullInt64
+		clipAccessCode, clipAccessToken sql.NullString
 	)
 	if err := scan(&id, &filename, &fileSize, &mime, &chunkSize, &totalChunks,
 		&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID,
-		&quotaReleased); err != nil {
+		&quotaReleased, &clipExpiresAt, &clipMaxDownloads, &clipAccessCode, &clipAccessToken); err != nil {
 		return nil, err
 	}
-	return &UploadSession{
+	session := &UploadSession{
 		ID: id, Filename: filename, FileSize: fileSize, MimeType: mime,
 		ChunkSize: chunkSize, TotalChunks: totalChunks, Status: status,
 		EnvironmentID: env, RequestID: requestID.String,
 		CreatedAt: createdAt, UpdatedAt: updatedAt,
 		ExpiresAt: expiresAt, StagedPath: stagedPath.String, ClipID: clipID.String,
 		QuotaReleased: quotaReleased != 0,
-	}, nil
+	}
+	// Clip params are read unconditionally: they belong to every session now.
+	// A row written by an older version simply reports ClipExpiresAt == 0 and is
+	// refused by COMPLETE (it has no clip params to honour).
+	if clipExpiresAt.Valid {
+		session.ClipExpiresAt = clipExpiresAt.Int64
+	}
+	if clipMaxDownloads.Valid {
+		v := int(clipMaxDownloads.Int64)
+		session.ClipMaxDownloads = &v
+	}
+	if clipAccessCode.Valid && clipAccessCode.String != "" {
+		code := clipAccessCode.String
+		session.ClipAccessCode = &code
+	}
+	if clipAccessToken.Valid && clipAccessToken.String != "" {
+		token := clipAccessToken.String
+		session.ClipAccessToken = &token
+	}
+	return session, nil
 }
 
 const uploadColumns = `id, filename, file_size, mime_type, chunk_size, total_chunks,
 	status, environment_id, created_at, updated_at, expires_at, staged_path, clip_id, request_id,
-	quota_released`
+	quota_released, clip_expires_at, clip_max_downloads, clip_access_code, clip_access_token`
 
 // CreateUploadSessionParams groups arguments for CreateUploadSession.
+// Clip params come from the init request (already validated by the API layer)
+// and are stored on the session; COMPLETE turns them into a clip row.
 type CreateUploadSessionParams struct {
-	Filename      string
-	FileSize      int64
-	MimeType      string
-	EnvironmentID string
-	RequestID     string // optional client idempotency key
-	ChunkSize     int
-	TTLSeconds    int
+	Filename string
+	FileSize int64
+	MimeType string
+	// EnvironmentID is required: every upload becomes a clip and a clip without
+	// an owner would be unreachable (it is the only way to list a nameless clip).
+	EnvironmentID    string
+	RequestID        string // optional client idempotency key
+	ChunkSize        int
+	TTLSeconds       int
+	ClipExpiresAt    int64
+	ClipMaxDownloads *int
+	ClipAccessCode   *string
+	ClipAccessToken  *string
 }
 
 // normalizeUploadParams applies defaults and validates an init request.
@@ -164,6 +201,10 @@ func (r *ClipRepository) normalizeUploadParams(params CreateUploadSessionParams)
 	}
 	if params.FileSize < 0 {
 		return nil, errors.New("file size must be >= 0")
+	}
+	environmentID := strings.TrimSpace(params.EnvironmentID)
+	if environmentID == "" {
+		return nil, errors.New("environment id is required for every upload session")
 	}
 	chunkSize := params.ChunkSize
 	if chunkSize <= 0 {
@@ -179,13 +220,20 @@ func (r *ClipRepository) normalizeUploadParams(params CreateUploadSessionParams)
 		mime = "application/octet-stream"
 	}
 	now := nowUnix()
-	return &UploadSession{
+	session := &UploadSession{
 		ID: uuid.NewString(), Filename: filename, FileSize: params.FileSize,
 		MimeType: mime, ChunkSize: chunkSize, TotalChunks: total,
-		Status: UploadStatusActive, EnvironmentID: strings.TrimSpace(params.EnvironmentID),
+		Status: UploadStatusActive, EnvironmentID: environmentID,
 		RequestID: strings.TrimSpace(params.RequestID),
 		CreatedAt: now, UpdatedAt: now, ExpiresAt: now + int64(ttl),
-	}, nil
+		// Clip params are stored for every session: COMPLETE always creates the
+		// clip from them (there is no "regular file upload").
+		ClipExpiresAt:    params.ClipExpiresAt,
+		ClipMaxDownloads: params.ClipMaxDownloads,
+		ClipAccessCode:   params.ClipAccessCode,
+		ClipAccessToken:  params.ClipAccessToken,
+	}
+	return session, nil
 }
 
 // CreateUploadSession inserts a new active session. Pure DB work (short lock).
@@ -205,11 +253,15 @@ func (r *ClipRepository) insertUploadSession(session *UploadSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, err := r.db.Exec(`INSERT INTO upload_sessions (`+uploadColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?)`,
 		session.ID, session.Filename, session.FileSize, session.MimeType,
 		session.ChunkSize, session.TotalChunks, session.Status,
 		session.EnvironmentID, session.CreatedAt, session.UpdatedAt, session.ExpiresAt,
 		nullIfEmpty(session.RequestID),
+		nullInt64Zero(session.ClipExpiresAt),
+		nullIntPtr(session.ClipMaxDownloads),
+		nullStringPtr(session.ClipAccessCode),
+		nullStringPtr(session.ClipAccessToken),
 	)
 	return err
 }
@@ -495,6 +547,27 @@ func nullIfEmpty(s string) interface{} {
 	return s
 }
 
+func nullInt64Zero(v int64) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func nullIntPtr(p *int) interface{} {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func nullStringPtr(p *string) interface{} {
+	if p == nil || *p == "" {
+		return nil
+	}
+	return *p
+}
+
 // CompleteUploadSession flips completing->completed (recording clip linkage).
 func (r *ClipRepository) CompleteUploadSession(uploadID string, clipID string) (*UploadSession, error) {
 	now := nowUnix()
@@ -738,27 +811,11 @@ func (r *ClipRepository) ListUploadSessions() ([]*UploadSession, error) {
 	defer rows.Close()
 	var out []*UploadSession
 	for rows.Next() {
-		var (
-			id, filename, mime, status, env string
-			fileSize                        int64
-			chunkSize, totalChunks          int
-			createdAt, updatedAt, expiresAt int64
-			stagedPath, clipID, requestID   sql.NullString
-			quotaReleased                   int
-		)
-		if err := rows.Scan(&id, &filename, &fileSize, &mime, &chunkSize, &totalChunks,
-			&status, &env, &createdAt, &updatedAt, &expiresAt, &stagedPath, &clipID, &requestID,
-			&quotaReleased); err != nil {
+		session, err := scanUploadSession(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, &UploadSession{
-			ID: id, Filename: filename, FileSize: fileSize, MimeType: mime,
-			ChunkSize: chunkSize, TotalChunks: totalChunks, Status: status,
-			EnvironmentID: env, RequestID: requestID.String,
-			CreatedAt: createdAt, UpdatedAt: updatedAt,
-			ExpiresAt: expiresAt, StagedPath: stagedPath.String, ClipID: clipID.String,
-			QuotaReleased: quotaReleased != 0,
-		})
+		out = append(out, session)
 	}
 	return out, rows.Err()
 }
