@@ -130,6 +130,8 @@ const App = () => {
   const [captchaResetKey, setCaptchaResetKey] = useState(0);
   const [captchaConfig, setCaptchaConfig] = useState<AppConfig | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+  const [isSettingsInitialized, setIsSettingsInitialized] = useState(false);
+  const tRef = useRef(t);
 
   const isDarkTheme = themeMode === "dark";
 
@@ -161,6 +163,10 @@ const App = () => {
   };
 
   useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+
+  useEffect(() => {
     try {
       const rawSettings = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
       if (rawSettings) {
@@ -186,37 +192,44 @@ const App = () => {
       }
     } catch (error) {
       console.warn("Failed to load environment settings:", error);
+    } finally {
+      setIsSettingsInitialized(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (!isSettingsInitialized || !settings.environmentId) {
+      return;
+    }
+
     let cancelled = false;
 
     const loadRemoteClips = async () => {
-      if (!settings.environmentId) {
-        return;
-      }
       try {
         const clips = await listRemoteClips(settings.environmentId);
         if (!cancelled) {
           setRemoteClips(clips);
         }
       } catch (error) {
-        console.warn(t("toast.loadFailed"), error);
+        const message = tRef.current("toast.loadFailed");
+        console.warn(message, error);
         if (!cancelled) {
-          setToast({ kind: "error", message: t("toast.loadFailed") });
+          setToast({ kind: "error", message });
         }
       }
     };
 
-    loadRemoteClips();
-    const timer = window.setInterval(loadRemoteClips, 60_000);
+    void loadRemoteClips();
+    const timer = window.setInterval(() => {
+      void loadRemoteClips();
+    }, 60_000);
+
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [setRemoteClips, settings.environmentId, t]);
+  }, [isSettingsInitialized, setRemoteClips, settings.environmentId]);
 
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
