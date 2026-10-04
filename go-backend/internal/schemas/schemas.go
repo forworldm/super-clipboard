@@ -75,7 +75,12 @@ func ParseClipCreateRequest(body []byte) (*ClipCreateRequest, *ValidationError) 
 	maxDownloads, _ := fields.optionalInt("maxDownloads", &greaterThanZero, nil)
 	request.MaxDownloads = maxDownloads
 
-	accessCode, okCode := fields.optionalString("accessCode", 5, 12)
+	// Every string below is explicitly bounded (see limits.go): accessCode is
+	// 5..12 characters, accessToken 7..128 characters AND bytes, environmentId
+	// 1..64, captchaToken 1..4096. The persistent token used to be unbounded
+	// (max_length was skipped), which let a client persist an arbitrary sized
+	// value as a lookup key.
+	accessCode, okCode := fields.optionalBound("accessCode", accessCodeBound)
 	if okCode && accessCode != nil {
 		// @field_validator("accessCode") ensure_access_code
 		trimmed := strings.TrimSpace(*accessCode)
@@ -90,17 +95,17 @@ func ParseClipCreateRequest(body []byte) (*ClipCreateRequest, *ValidationError) 
 		}
 	}
 
-	accessToken, okToken := fields.optionalString("accessToken", 7, 0)
+	accessToken, okToken := fields.optionalBound("accessToken", accessTokenBound)
 	if okToken && accessToken != nil {
 		// @field_validator("accessToken") ensure_access_token
 		trimmed := strings.TrimSpace(*accessToken)
 		request.AccessToken = &trimmed
 	}
 
-	environmentID, _ := fields.requiredString("environmentId", 1, 64)
+	environmentID, _ := fields.requiredBound("environmentId", environmentIDBound)
 	request.EnvironmentID = environmentID
 
-	captchaToken, okCaptcha := fields.optionalString("captchaToken", 1, 4096)
+	captchaToken, okCaptcha := fields.optionalBound("captchaToken", captchaTokenBound)
 	if okCaptcha && captchaToken != nil {
 		// @field_validator("captchaToken") trim_captcha_token
 		trimmed := strings.TrimSpace(*captchaToken)
@@ -116,7 +121,12 @@ func ParseClipCreateRequest(body []byte) (*ClipCreateRequest, *ValidationError) 
 
 	payloadFields, okPayload := fields.object("payload", true)
 	if okPayload && payloadFields != nil {
-		text, _ := payloadFields.optionalString("text", 0, 0)
+		// payload.text is capped at 64 KiB (characters AND UTF-8 bytes). Text
+		// used to be unbounded, so the only limit was readBody's 1 MiB: a
+		// single clip could store ~1 MiB of inline text that is then echoed by
+		// every list response. Oversized text must travel as a file clip
+		// (POST /api/uploads/init + PUT .../chunks/{index}).
+		text, _ := payloadFields.optionalBound("text", clipTextBound)
 		request.Payload.Text = text
 		storedFile, _ := parseStoredFileInput(payloadFields)
 		request.Payload.File = storedFile
@@ -165,19 +175,22 @@ func parseStoredFileInput(payload *objectFields) (*StoredFileInput, bool) {
 	}
 	stored := &StoredFileInput{}
 
-	name, okName := fileFields.requiredString("name", 1, 255)
+	name, okName := fileFields.requiredBound("name", storedFileNameBound)
 	stored.Name = name
 
 	greaterOrEqualZero := int64(0)
 	size, okSize := fileFields.requiredInt("size", nil, &greaterOrEqualZero)
 	stored.Size = size
 
-	fileType, okType := fileFields.optionalString("type", 0, 255)
+	fileType, okType := fileFields.optionalBound("type", mimeTypeBound)
 	if okType && fileType != nil {
 		stored.Type = *fileType
 	}
 
-	dataURL, okData := fileFields.requiredString("dataUrl", 1, 0)
+	// dataUrl is the inline base64 payload: bound it explicitly instead of
+	// relying on the route's body cap, and keep the chunked upload endpoint as
+	// the documented path for real files.
+	dataURL, okData := fileFields.requiredBound("dataUrl", dataURLBound)
 	if okData {
 		// @field_validator("dataUrl") ensure_data_url
 		if !strings.HasPrefix(dataURL, "data:") {
@@ -201,8 +214,11 @@ func ParseTokenRegisterRequest(body []byte) (*TokenRegisterRequest, *ValidationE
 	if validationError != nil {
 		return nil, validationError
 	}
-	token, _ := fields.requiredString("token", 7, 0)
-	environmentID, okEnv := fields.optionalString("environmentId", 1, 64)
+	// The registered token is the very same persistent token used by
+	// POST /api/clips, so it shares its bound (7..128 characters/bytes). It was
+	// previously unbounded, which made it a free-form row key.
+	token, _ := fields.requiredBound("token", accessTokenBound)
+	environmentID, okEnv := fields.optionalBound("environmentId", environmentIDBound)
 	if okEnv && environmentID != nil {
 		// @field_validator("environmentId") ensure_owner
 		trimmed := strings.TrimSpace(*environmentID)

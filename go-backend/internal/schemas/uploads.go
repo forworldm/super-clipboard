@@ -41,15 +41,18 @@ func ParseUploadInitRequest(body []byte) (*UploadInitRequest, *ValidationError) 
 	if validationError != nil {
 		return nil, validationError
 	}
-	filename, _ := fields.requiredString("filename", 1, 255)
+	// Same bounds as ClipCreateRequest (limits.go): a file clip created through
+	// the chunked path must not accept a bigger text/token/name than the inline
+	// path, otherwise the bound is trivial to bypass.
+	filename, _ := fields.requiredBound("filename", storedFileNameBound)
 	// fileSize: int >= 0 (upper bound checked in handler for a 400 + i18n message).
 	geZero := int64(0)
 	fileSize, _ := fields.requiredInt("fileSize", nil, &geZero)
-	mimeOpt, _ := fields.optionalString("mimeType", 0, 255)
+	mimeOpt, _ := fields.optionalBound("mimeType", mimeTypeBound)
 	// environmentId is mandatory for every upload (see UploadInitRequest).
-	env, _ := fields.requiredString("environmentId", 1, 64)
-	requestIDOpt, okReq := fields.optionalString("requestId", 4, 128)
-	captchaToken, okCaptcha := fields.optionalString("captchaToken", 1, 4096)
+	env, _ := fields.requiredBound("environmentId", environmentIDBound)
+	requestIDOpt, okReq := fields.optionalBound("requestId", requestIDBound)
+	captchaToken, okCaptcha := fields.optionalBound("captchaToken", captchaTokenBound)
 	captchaProvider, _ := fields.optionalLiteral("captchaProvider", []string{"turnstile", "recaptcha"})
 
 	// Clip params: expiresAt is required (a clip without a future expiry can
@@ -58,7 +61,7 @@ func ParseUploadInitRequest(body []byte) (*UploadInitRequest, *ValidationError) 
 	expiresAt, _ := fields.requiredInt("expiresAt", &greaterThanZero, nil)
 	maxDownloads, _ := fields.optionalInt("maxDownloads", &greaterThanZero, nil)
 	var accessCode *string
-	code, okCode := fields.optionalString("accessCode", 5, 12)
+	code, okCode := fields.optionalBound("accessCode", accessCodeBound)
 	if okCode && code != nil {
 		t := strings.TrimSpace(*code)
 		switch {
@@ -71,7 +74,7 @@ func ParseUploadInitRequest(body []byte) (*UploadInitRequest, *ValidationError) 
 		}
 	}
 	var accessToken *string
-	token, okToken := fields.optionalString("accessToken", 7, 0)
+	token, okToken := fields.optionalBound("accessToken", accessTokenBound)
 	if okToken && token != nil {
 		t := strings.TrimSpace(*token)
 		accessToken = &t

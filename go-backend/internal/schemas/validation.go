@@ -151,7 +151,22 @@ func (o *objectFields) result() *ValidationError {
 }
 
 // requiredString implements `name: str = Field(min_length=..., max_length=...)`.
+// maxLen == 0 means "unbounded", which is only acceptable for fields that are
+// bounded by the request body itself; prefer requiredBound with an explicit
+// byte cap for anything a client can inflate.
 func (o *objectFields) requiredString(name string, minLen, maxLen int) (string, bool) {
+	return o.requiredBound(name, stringBound{MinRunes: minLen, MaxRunes: maxLen})
+}
+
+// optionalString implements `name: Optional[str] = Field(default=None, ...)`.
+// A missing key or an explicit null both yield (nil, true).
+func (o *objectFields) optionalString(name string, minLen, maxLen int) (*string, bool) {
+	return o.optionalBound(name, stringBound{MinRunes: minLen, MaxRunes: maxLen})
+}
+
+// requiredBound is requiredString with both a character bound (pydantic's
+// max_length) and a UTF-8 byte bound (see stringBound).
+func (o *objectFields) requiredBound(name string, bound stringBound) (string, bool) {
 	raw, present := o.raw[name]
 	if !present {
 		o.add(detail("missing", o.path(name), "Field required", nil))
@@ -161,12 +176,12 @@ func (o *objectFields) requiredString(name string, minLen, maxLen int) (string, 
 	if !ok {
 		return "", false
 	}
-	return value, o.checkStringBounds(name, value, minLen, maxLen)
+	return value, o.checkBound(name, value, bound)
 }
 
-// optionalString implements `name: Optional[str] = Field(default=None, ...)`.
+// optionalBound is optionalString with both a character and a byte bound.
 // A missing key or an explicit null both yield (nil, true).
-func (o *objectFields) optionalString(name string, minLen, maxLen int) (*string, bool) {
+func (o *objectFields) optionalBound(name string, bound stringBound) (*string, bool) {
 	raw, present := o.raw[name]
 	if !present || isNull(raw) {
 		return nil, true
@@ -175,7 +190,7 @@ func (o *objectFields) optionalString(name string, minLen, maxLen int) (*string,
 	if !ok {
 		return nil, false
 	}
-	if !o.checkStringBounds(name, value, minLen, maxLen) {
+	if !o.checkBound(name, value, bound) {
 		return nil, false
 	}
 	return &value, true
@@ -191,18 +206,58 @@ func (o *objectFields) readString(name string, raw json.RawMessage) (string, boo
 }
 
 func (o *objectFields) checkStringBounds(name string, value string, minLen, maxLen int) bool {
+	return o.checkBound(name, value, stringBound{MinRunes: minLen, MaxRunes: maxLen})
+}
+
+// stringBound is the accepted size of one client supplied string.
+//
+// MaxRunes mirrors pydantic's max_length (characters) so the historical error
+// messages and the frontend's error mapping stay intact. MaxBytes is the UTF-8
+// byte ceiling that actually protects the process: without it a payload of
+// 4-byte characters would pass a character count while costing four times the
+// memory, the JSON body and the database row. Zero means "no bound".
+type stringBound struct {
+	MinRunes int
+	MaxRunes int
+	MaxBytes int
+	// TooLongMessage replaces the generic wording when either upper bound is
+	// exceeded. Fields whose bound is a usability decision rather than a pure
+	// format rule (oversized clip text, inline file data) use it to name the
+	// supported alternative instead of only reporting a number.
+	TooLongMessage string
+}
+
+// checkBound enforces a stringBound. The character check keeps pydantic's
+// exact wording, and both overflow paths report `string_too_long` so clients
+// keep treating them as the same size rejection.
+func (o *objectFields) checkBound(name string, value string, bound stringBound) bool {
 	length := utf8.RuneCountInString(value)
-	if minLen > 0 && length < minLen {
+	if bound.MinRunes > 0 && length < bound.MinRunes {
 		o.add(detail("string_too_short", o.path(name),
-			fmt.Sprintf("String should have at least %d character%s", minLen, plural(minLen)), value))
+			fmt.Sprintf("String should have at least %d character%s", bound.MinRunes, plural(bound.MinRunes)), value))
 		return false
 	}
-	if maxLen > 0 && length > maxLen {
-		o.add(detail("string_too_long", o.path(name),
-			fmt.Sprintf("String should have at most %d character%s", maxLen, plural(maxLen)), value))
+	if bound.MaxRunes > 0 && length > bound.MaxRunes {
+		o.add(detail("string_too_long", o.path(name), bound.tooLongMessage(func() string {
+			return fmt.Sprintf("String should have at most %d character%s", bound.MaxRunes, plural(bound.MaxRunes))
+		}), value))
+		return false
+	}
+	if bound.MaxBytes > 0 && len(value) > bound.MaxBytes {
+		o.add(detail("string_too_long", o.path(name), bound.tooLongMessage(func() string {
+			return fmt.Sprintf("String should have at most %d byte%s", bound.MaxBytes, plural(bound.MaxBytes))
+		}), value))
 		return false
 	}
 	return true
+}
+
+// tooLongMessage returns the custom hint when one is configured.
+func (b stringBound) tooLongMessage(fallback func() string) string {
+	if b.TooLongMessage != "" {
+		return b.TooLongMessage
+	}
+	return fallback()
 }
 
 // requiredInt implements `name: int = Field(gt=..., ge=...)`.
