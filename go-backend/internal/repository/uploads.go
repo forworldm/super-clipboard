@@ -22,6 +22,12 @@
 //     cover); a row left in `completing` by a power loss is rolled back to
 //     `active` by startup reconciliation (ResetStuckCompleting), keeping its
 //     pre-allocated file and its receipts.
+//   - Quota: `completing` STILL HOLDS its reservation -- the flip is not a
+//     release, and only the terminal transitions (complete success, abort,
+//     expiry purge) call releaseQuotaTx. The ledger is therefore keyed on the
+//     quota_released flag alone (reservationsHeldPredicate in quota.go), never on
+//     the status column; see RecomputeUploadQuota for why a status filter there
+//     would silently grant the bytes twice.
 package repository
 
 import (
@@ -642,9 +648,11 @@ func (r *ClipRepository) TryBeginComplete(uploadID string) (*UploadSession, []in
 }
 
 // SessionUnavailableError means an idempotency key is still held by a session
-// that is already expired but cannot be purged yet (it is mid-merge). Returning
-// that stale row would hand the client a 200 with an unusable uploadId, so the
-// caller refuses instead and lets the client retry once the merge settled.
+// that is already expired but cannot be purged yet (it is `completing`, i.e. a
+// COMPLETE may be inserting its clip, or the row is inside the purge grace
+// window). Returning that stale row would hand the client a 200 with an unusable
+// uploadId, so the caller refuses instead and lets the client retry once the
+// transition settled.
 type SessionUnavailableError struct{ Session *UploadSession }
 
 func (e *SessionUnavailableError) Error() string { return "upload session is not usable yet" }
@@ -790,9 +798,10 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 	// The session goes back to `active` and KEEPS its bytes on disk, so it must
 	// keep its quota reservation as well: releasing here would leave live bytes
 	// unaccounted for (a quota bypass for up to the session TTL) and contradict
-	// RecomputeUploadQuota, which sums file_size over active sessions that still
-	// hold a reservation. The reservation is returned by the terminal
-	// transitions only: complete success, DELETE (abort) or expiry purge.
+	// RecomputeUploadQuota, which sums file_size over every session that still
+	// holds a reservation (quota_released = 0, i.e. `active` AND `completing`).
+	// The reservation is returned by the terminal transitions only: complete
+	// success, DELETE (abort) or expiry purge.
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
@@ -801,10 +810,12 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 
 // AbortUploadSession deletes the session + chunk rows atomically and returns
 // the session for file cleanup outside the lock. Completed sessions linked to
-// a clip are NOT abortable (delete the clip instead); a session mid-assembly
-// (`completing`) is also refused so a cancel can never tear down an in-flight
-// merge and leave its staged file orphaned — the merge rolls back on crash and
-// the caller can retry DELETE after that.
+// a clip are NOT abortable (delete the clip instead); a `completing` session is
+// also refused so a cancel can never tear down a COMPLETE whose clip INSERT (and
+// its pending completing->completed flip) is in flight — such a session rolls
+// back to `active` on failure (FailComplete) or at startup
+// (ResetStuckCompleting), and the caller can retry DELETE after that. In both
+// cases the reservation stays where it belongs: with the session row.
 func (r *ClipRepository) AbortUploadSession(uploadID string) (*UploadSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -852,21 +863,50 @@ type UploadPurgeVictim struct {
 	FileSize   int64
 }
 
+// CompletingPurgeGraceSeconds is how long an EXPIRED `completing` row is
+// protected from the destructive expiry purge.
+//
+// `completing` is a reservation holder (see reservationsHeldPredicate), so a row
+// left there by a crash keeps its bytes reserved. Skipping such rows FOREVER --
+// as this function used to -- meant the reservation could only come back at the
+// next process start (ResetStuckCompleting); on a long-running server those
+// bytes stayed reserved for good. The grace window is what makes the reclaim
+// safe: the flip is taken right before the clip INSERT and every chunk was
+// already written (and fsynced) during PUT, so COMPLETE performs no file IO
+// after it and cannot plausibly still be running minutes later.
+const CompletingPurgeGraceSeconds int64 = 900 // 15 min
+
 // PurgeExpiredUploads deletes expired sessions and returns victims for file
 // cleanup outside the lock. Completed sessions with a clip keep their clip file;
-// only the session row + chunk dir are dropped.
+// only the session row + chunk receipts are dropped.
 //
-// `completing` rows are intentionally skipped: their staged file is being
-// written right now, and unlinking it would leave the clip inserted moments
-// later pointing at a file that no longer exists. A merge that fails rolls the
-// row back to `active` (and the next pass then purges it); a merge whose process
-// died is rolled back by ResetStuckCompleting on startup -- so nothing leaks.
+// Expired `completing` rows are purged only once they are older than
+// CompletingPurgeGraceSeconds (updated_at is refreshed by the active->completing
+// flip), because a COMPLETE that is still in flight is about to insert its clip
+// and unlinking its file would leave that clip pointing at nothing. The grace
+// window is the guard; as a second guard the victim reports HasClip when a clip
+// row already references the staged path, so the file survives even if the purge
+// interleaves between the clip INSERT and the completing->completed flip.
 func (r *ClipRepository) PurgeExpiredUploads(nowUnixSec int64) ([]UploadPurgeVictim, error) {
+	return r.PurgeExpiredUploadsWithGrace(nowUnixSec, CompletingPurgeGraceSeconds)
+}
+
+// PurgeExpiredUploadsWithGrace is PurgeExpiredUploads with an explicit grace
+// window (<= 0 purges a stale `completing` row immediately). Tests use it to
+// drive the window deterministically.
+func (r *ClipRepository) PurgeExpiredUploadsWithGrace(nowUnixSec int64, completingGraceSeconds int64) ([]UploadPurgeVictim, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rows, err := r.db.Query(
-		"SELECT id, staged_path, clip_id, file_size FROM upload_sessions WHERE expires_at <= ? AND status <> ?",
-		nowUnixSec, UploadStatusCompleting)
+	cutoff := nowUnixSec - completingGraceSeconds
+	rows, err := r.db.Query(`
+		SELECT s.id, s.staged_path, s.file_size,
+			CASE WHEN s.clip_id IS NOT NULL AND s.clip_id <> '' THEN 1
+				WHEN s.staged_path IS NOT NULL AND EXISTS (
+					SELECT 1 FROM clips c WHERE c.file_path = s.staged_path) THEN 1
+				ELSE 0 END AS has_clip
+		FROM upload_sessions s
+		WHERE s.expires_at <= ? AND (s.status <> ? OR s.updated_at <= ?)`,
+		nowUnixSec, UploadStatusCompleting, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -874,13 +914,14 @@ func (r *ClipRepository) PurgeExpiredUploads(nowUnixSec int64) ([]UploadPurgeVic
 	for rows.Next() {
 		var id string
 		var fileSize int64
-		var staged, clip sql.NullString
-		if err := rows.Scan(&id, &staged, &clip, &fileSize); err != nil {
+		var hasClip int64
+		var staged sql.NullString
+		if err := rows.Scan(&id, &staged, &fileSize, &hasClip); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		victims = append(victims, UploadPurgeVictim{
-			UploadID: id, StagedPath: staged.String, HasClip: clip.String != "",
+			UploadID: id, StagedPath: staged.String, HasClip: hasClip != 0,
 			FileSize: fileSize,
 		})
 	}
@@ -1068,6 +1109,25 @@ func (r *ClipRepository) UploadSessionExists(uploadID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// AgeCompletingForTest pushes updated_at of a `completing` session into the
+// past. updated_at is the clock the `completing` purge grace is measured
+// against (see CompletingPurgeGraceSeconds), so this is how tests simulate a
+// COMPLETE that died mid-flight. Returns false when the row is not completing.
+func (r *ClipRepository) AgeCompletingForTest(uploadID string, ageSeconds int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, err := r.db.Exec("UPDATE upload_sessions SET updated_at = ? WHERE id = ? AND status = ?",
+		nowUnix()-ageSeconds, uploadID, UploadStatusCompleting)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 // SetUploadExpiryForTest forces expires_at (timeout-path tests only).

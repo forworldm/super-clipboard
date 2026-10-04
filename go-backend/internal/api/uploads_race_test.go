@@ -50,6 +50,14 @@ func TestInitReplayStaleInFlightIsConflict(t *testing.T) {
 	if reserved, _ := app.Repo.UploadQuotaValue(); reserved != 1024 {
 		t.Fatalf("reserved = %d, want 1024 (still held by the in-flight session)", reserved)
 	}
+	// ... and the periodic repair must keep it that way: the ledger is keyed on
+	// the quota_released flag, not on `status = 'active'`, so a `completing`
+	// session's bytes must survive RecomputeUploadQuota (otherwise the repair
+	// itself would hand those bytes to the next init).
+	if recomputed, previous, err := app.Repo.RecomputeUploadQuota(); err != nil || recomputed != 1024 || previous != 1024 {
+		t.Fatalf("recompute = %d (previous %d, err %v), want 1024/1024: a completing session still holds its quota",
+			recomputed, previous, err)
+	}
 }
 
 // TestQuotaHeldAfterCompleteRollback proves the ledger invariant end-to-end: a

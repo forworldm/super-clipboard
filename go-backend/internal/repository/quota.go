@@ -45,8 +45,30 @@ func (r *ClipRepository) UploadQuotaValue() (int64, error) {
 	return quota.ReservedBytes, nil
 }
 
-// CountActiveUploadSessions counts sessions still holding a reservation slot
-// (the `active` state is the only one that reserves disk for chunks).
+// reservationsHeldPredicate is the ONE authoritative definition of "this row
+// still holds its upload quota reservation" and therefore of "the ledger must
+// count these file_size bytes".
+//
+// The predicate is quota_released ALONE, on purpose -- never `status`:
+//
+//   - `active`     holds its reservation (bytes are in the pre-allocated file);
+//   - `completing` ALSO holds it: the state flip is a pure concurrency guard
+//     taken before the clip INSERT, and releaseQuotaTx only runs on the
+//     terminal transitions (complete success, abort, expiry purge). A ledger
+//     query filtered with `status = 'active'` would therefore miss completing
+//     sessions, and RecomputeUploadQuota would "repair" that missing amount
+//     away -- silently freeing bytes another upload could reserve twice.
+//   - `completed` carries quota_released = 1 (released inside the very same
+//     transaction as the status flip), so it is excluded by the flag itself.
+//
+// Keep this predicate in sync with releaseQuotaTx (which CASes exactly on it)
+// and with uploadQuotaSeedRow in repository.go.
+const reservationsHeldPredicate = `quota_released = 0`
+
+// CountActiveUploadSessions counts sessions in the `active` state. It is a
+// DIAGNOSTIC counter only: `completing` sessions are not `active` yet they do
+// hold their reservation, so this number must never be compared against the
+// ledger. Use CountUploadSessionsHoldingQuota for quota decisions.
 func (r *ClipRepository) CountActiveUploadSessions() (int64, error) {
 	var count int64
 	if err := r.db.QueryRow(
@@ -54,6 +76,43 @@ func (r *ClipRepository) CountActiveUploadSessions() (int64, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// CountUploadSessionsHoldingQuota counts the sessions that still hold an upload
+// quota reservation (active + completing). It is the count behind the
+// MaxActiveUploadSessions gate: the resource that cap protects is a reserved
+// slot in the ledger, and a completing session still owns one until its
+// terminal transition.
+func (r *ClipRepository) CountUploadSessionsHoldingQuota() (int64, error) {
+	var count int64
+	if err := r.db.QueryRow(
+		"SELECT COUNT(*) FROM upload_sessions WHERE " + reservationsHeldPredicate).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ExpectedReservedBytes is the convergent value of the ledger: SUM(file_size)
+// over every session that still holds its reservation (active + completing).
+func (r *ClipRepository) ExpectedReservedBytes() (int64, error) {
+	var sum int64
+	if err := r.db.QueryRow(
+		"SELECT COALESCE(SUM(file_size), 0) FROM upload_sessions WHERE " + reservationsHeldPredicate).Scan(&sum); err != nil {
+		return 0, err
+	}
+	return sum, nil
+}
+
+// UploadQuotaDrift reports the ledger and the value it must equal. It never
+// writes anything (diagnostics + tests).
+func (r *ClipRepository) UploadQuotaDrift() (ledger int64, expected int64, err error) {
+	if ledger, err = r.UploadQuotaValue(); err != nil {
+		return 0, 0, err
+	}
+	if expected, err = r.ExpectedReservedBytes(); err != nil {
+		return 0, 0, err
+	}
+	return ledger, expected, nil
 }
 
 // ReserveUploadQuota atomically moves fileSize into the ledger.
@@ -145,14 +204,16 @@ func (r *ClipRepository) CompensateUploadQuota(fileSize int64) (bool, error) {
 //
 // Only when that CAS wins (RowsAffected == 1) is the ledger decremented, so a
 // session can never return its reservation twice no matter how abort, expiry
-// cleanup and complete race. Callers must hold r.mu.
+// cleanup and complete race. The CAS predicate is exactly
+// reservationsHeldPredicate, i.e. the ledger query and the release agree on
+// what "holds a reservation" means. Callers must hold r.mu.
 func (r *ClipRepository) releaseQuotaTx(tx *sql.Tx, uploadID string, fileSize int64) (bool, error) {
 	if fileSize < 0 {
 		return false, errors.New("file size must be >= 0")
 	}
 	now := nowUnix()
 	res, err := tx.Exec(`UPDATE upload_sessions SET quota_released = 1, updated_at = ?
-		WHERE id = ? AND quota_released = 0`, now, uploadID)
+		WHERE id = ? AND `+reservationsHeldPredicate, now, uploadID)
 	if err != nil {
 		return false, err
 	}
@@ -191,12 +252,19 @@ func (r *ClipRepository) ReleaseUploadQuota(uploadID string, fileSize int64) (bo
 }
 
 // RecomputeUploadQuota is the cleanup-worker reconciliation: it recomputes the
-// reservation from the sessions that should hold one and overwrites the ledger,
+// reservation from the sessions that still hold one and overwrites the ledger,
 // repairing any drift left by a crash between "reserve" and "insert".
 //
-//	recompute = SUM(file_size) WHERE status='active' AND quota_released = 0
+//	recompute = SUM(file_size) FROM upload_sessions WHERE quota_released = 0
 //
-// Only the counter is repaired -- no file is touched.
+// The predicate is the release CAS flag ALONE (see reservationsHeldPredicate):
+// every status that still owns a reservation is summed, `active` AND
+// `completing`. Adding a `status = 'active'` filter here would be a bug, not a
+// tightening: it would drop the rows whose status was already flipped to
+// `completing` (which happens BEFORE the clip INSERT and therefore before the
+// release) and the repair would then write a too-small ledger -- silently
+// handing those bytes out to the next init while the original session still
+// owns its file. Only the counter is repaired -- no file is touched.
 func (r *ClipRepository) RecomputeUploadQuota() (recomputed int64, previous int64, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -206,7 +274,7 @@ func (r *ClipRepository) RecomputeUploadQuota() (recomputed int64, previous int6
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if err := tx.QueryRow(`SELECT COALESCE(SUM(file_size), 0) FROM upload_sessions
-		WHERE status = ? AND quota_released = 0`, UploadStatusActive).Scan(&recomputed); err != nil {
+		WHERE ` + reservationsHeldPredicate).Scan(&recomputed); err != nil {
 		return 0, 0, err
 	}
 	if err := tx.QueryRow("SELECT reserved_bytes FROM upload_quota WHERE id = 1").Scan(&previous); err != nil {

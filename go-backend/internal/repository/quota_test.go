@@ -466,7 +466,9 @@ func mustListOne(t *testing.T, repo *ClipRepository) *UploadSession {
 }
 
 // TestRecomputeUploadQuotaFixesDrift: the cleanup worker overwrites the ledger
-// with SUM(file_size) of active, unreleased sessions.
+// with SUM(file_size) of the sessions that still hold a reservation
+// (quota_released = 0; see TestLedgerCountsCompletingSessions for the
+// `completing` case, which a status filter would drop).
 func TestRecomputeUploadQuotaFixesDrift(t *testing.T) {
 	repo := newTestRepository(t)
 	createReservingSession(t, repo, "a.bin", 300, 0)
@@ -490,8 +492,9 @@ func TestRecomputeUploadQuotaFixesDrift(t *testing.T) {
 	}
 }
 
-// TestRecomputeIgnoresReleasedAndCompletedSessions: only active sessions that
-// still hold their reservation are summed.
+// TestRecomputeIgnoresReleasedAndCompletedSessions: the release FLAG decides --
+// a session whose reservation was already returned is never summed again,
+// whatever its status says.
 func TestRecomputeIgnoresReleasedAndCompletedSessions(t *testing.T) {
 	repo := newTestRepository(t)
 	kept := createReservingSession(t, repo, "kept.bin", 250, 0)
@@ -512,8 +515,10 @@ func TestRecomputeIgnoresReleasedAndCompletedSessions(t *testing.T) {
 }
 
 // TestLegacyDatabaseMigratesUploadQuota opens a database written by the
-// pre-quota schema and verifies the migration creates upload_quota, seeds it
-// from the existing active sessions and flags their quota_released as 0.
+// pre-quota schema and verifies the migration creates upload_quota and seeds it
+// from the sessions that still hold a reservation. See
+// TestLegacyDatabaseQuotaSeedCountsEveryHolder for the `completing` + `completed`
+// combinations.
 func TestLegacyDatabaseMigratesUploadQuota(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "legacy.db")
@@ -558,7 +563,7 @@ func TestLegacyDatabaseMigratesUploadQuota(t *testing.T) {
 		t.Fatal("legacy sessions must default to quota_released = 0")
 	}
 	if got := reservedBytes(t, repo); got != 777 {
-		t.Fatalf("seeded reserved = %d, want 777 (only active, unreleased sessions)", got)
+		t.Fatalf("seeded reserved = %d, want 777 (the live session's bytes only)", got)
 	}
 }
 

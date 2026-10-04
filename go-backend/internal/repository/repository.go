@@ -108,10 +108,16 @@ var createTableStatements = []string{
 
 // uploadQuotaSeedRow creates the single ledger row for databases that predate
 // the quota feature. The starting balance is the reservation the existing
-// active sessions would hold, so an upgrade never grants free credit.
+// sessions still hold, so an upgrade never grants free credit.
+//
+// The predicate is reservationsHeldPredicate (`quota_released = 0`) verbatim --
+// NOT `status = 'active' AND ...`: a session left in `completing` by the crash
+// that triggered the upgrade still owns its pre-allocated file and must be
+// seeded, otherwise the migration hands its bytes to the next upload. Rows
+// carrying quota_released = 1 (finished uploads) stay out through the flag.
 const uploadQuotaSeedRow = `INSERT INTO upload_quota (id, reserved_bytes, updated_at)
 	SELECT 1, COALESCE(SUM(file_size), 0), strftime('%s','now')
-	FROM upload_sessions WHERE status = 'active' AND quota_released = 0
+	FROM upload_sessions WHERE quota_released = 0
 	ON CONFLICT(id) DO NOTHING`
 
 // clipQuotaSeedRow creates the single ledger row for databases that predate the
@@ -263,10 +269,22 @@ func (r *ClipRepository) ensureSchema() error {
 		// De-dup guard: legacy rows carry NULL, which the partial index ignores.
 	}
 	// upload_sessions.quota_released: 0 = this session still holds its upload
-	// quota reservation. Legacy rows default to 0, i.e. they keep holding the
-	// reservation they were created with (the ledger seed below counts them).
+	// quota reservation. The ALTER backfills 0 (= "assume it still holds its
+	// bytes", the conservative default) on every legacy row because the column
+	// did not exist before, so rows that certainly do NOT hold a reservation
+	// have to be flagged right here -- otherwise the seed below (which trusts the
+	// flag alone, see reservationsHeldPredicate) would reserve the bytes of every
+	// finished session an upgrade happens to find. A `completed` session released
+	// its reservation in the very transaction that flipped it to `completed`
+	// (and a pre-quota row never held one at all), so the flag is the truth for
+	// them; `active` and `completing` rows keep 0 and stay counted.
 	if !uploadColumns["quota_released"] {
 		if _, err := r.db.Exec("ALTER TABLE upload_sessions ADD COLUMN quota_released INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("unable to migrate schema: %w", err)
+		}
+		if _, err := r.db.Exec(
+			"UPDATE upload_sessions SET quota_released = 1 WHERE status = ? AND quota_released = 0",
+			UploadStatusCompleted); err != nil {
 			return fmt.Errorf("unable to migrate schema: %w", err)
 		}
 	}

@@ -301,17 +301,24 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	// reservation (atomic CAS in the DB), then the free-disk watermark. All of
 	// them run before the session row exists, so a refusal leaves nothing
 	// behind: no session, no file, no dangling reservation.
+	//
+	// The cap counts every session that still holds a reservation
+	// (quota_released = 0: `active` AND `completing`), because that is the
+	// resource it protects. Counting `status = 'active'` only would let a
+	// `completing` session slip out of the cap while it still keeps its slot in
+	// the ledger -- exactly the mismatch between "active" and "holds quota" that
+	// this file must not reintroduce.
 	quotaLimit := a.Settings.EffectiveUploadQuota()
 	sessionLimit := a.Settings.EffectiveMaxActiveUploadSessions()
 	if sessionLimit > 0 {
-		active, err := a.Repo.CountActiveUploadSessions()
+		holding, err := a.Repo.CountUploadSessionsHoldingQuota()
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		if active >= int64(sessionLimit) {
+		if holding >= int64(sessionLimit) {
 			writeError(w, apperr.NewStorageError(apperr.StorageCodeSessionLimit,
-				"活动上传会话数已达上限：%d / %d，请完成或取消进行中的上传后重试", active, sessionLimit))
+				"活动上传会话数已达上限：%d / %d，请完成或取消进行中的上传后重试", holding, sessionLimit))
 			return
 		}
 	}
@@ -749,14 +756,55 @@ func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	completed, err := a.Repo.CompleteUploadSession(uploadID, clip.ID)
 	if err != nil {
-		// The clip already exists (do NOT delete user data); just surface success
-		// via the clip (the session row is gone, so the link cannot be recorded).
+		// The session row disappeared between the flip and the commit: DELETE
+		// won the race, or the expiry purge reclaimed an expired row.
+		//
+		// The clip we just inserted is the only thing that still points at the
+		// bytes, so its file must win the other way round as well: if the purge
+		// unlinked the container (it had no clip_id at the time it ran), the clip
+		// we just wrote would dangle. Detect that and undo the clip row (which
+		// also returns its stored-bytes charge) instead of publishing a clip that
+		// can never be downloaded. When the file is still there, keep the clip --
+		// never delete user data -- and surface it as the success it is.
+		if a.rollbackDanglingClip(clip) {
+			a.logger.Printf("ERROR:    complete for %s lost its file to the expiry purge; clip %s rolled back",
+				uploadID, clip.ID)
+			writeError(w, newHTTPError(http.StatusConflict, "上传会话已失效，文件已被清理，请重新上传"))
+			return
+		}
 		a.logger.Printf("ERROR:    complete commit raced abort for %s (clip %s kept): %v", uploadID, clip.ID, err)
 		writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 		return
 	}
 	_ = completed
 	writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
+}
+
+// rollbackDanglingClip deletes a clip whose byte container vanished underneath
+// the COMPLETE sequence and reports whether it did.
+//
+// COMPLETE inserts the clip row (pointing at the already-final container) before
+// flipping the session to `completed`. If the expiry purge reclaimed that very
+// session in between -- it only does so once the row outlived the purge grace
+// window and no clip referenced its path yet -- it unlinked the container as
+// well, so the clip we just wrote would dangle forever. Publishing it would be a
+// 201 for a download that can only 404; rolling the row back (which also returns
+// the stored-bytes charge) lets the client upload again instead.
+//
+// A missing file is only ever acted on, never guessed at: a stat error means
+// "unknown", and unknown keeps the clip (never delete user data).
+func (a *App) rollbackDanglingClip(clip *models.Clip) bool {
+	if clip == nil || clip.StoredFile == nil || strings.TrimSpace(clip.StoredFile.Path) == "" {
+		return false
+	}
+	if _, exists, err := storage.VerifyFileSize(clip.StoredFile.Path); err != nil || exists {
+		return false
+	}
+	if _, err := a.Repo.DeleteClip(clip.ID, clip.EnvironmentID); err != nil {
+		a.logger.Printf("ERROR:    unable to roll back dangling clip %s: %v", clip.ID, err)
+		return false
+	}
+	return true
 }
 
 // replayCompletedUpload renders the idempotent result of an already-completed
@@ -986,9 +1034,10 @@ func (a *App) deleteUploadVictimFiles(victims []repository.UploadPurgeVictim) {
 	}
 }
 
-// reconcileUploadQuota recomputes the reserved bytes from live sessions and
-// overwrites the ledger, then logs the result. It only fixes the counter -- no
-// upload file and no clip file is touched.
+// reconcileUploadQuota recomputes the reserved bytes from the sessions that
+// still hold a reservation (`active` AND `completing`, i.e. quota_released = 0)
+// and overwrites the ledger, then logs the result. It only fixes the counter --
+// no upload file and no clip file is touched.
 func (a *App) reconcileUploadQuota() {
 	recomputed, previous, err := a.Repo.RecomputeUploadQuota()
 	if err != nil {
@@ -996,7 +1045,7 @@ func (a *App) reconcileUploadQuota() {
 		return
 	}
 	if recomputed != previous {
-		a.logger.Printf("WARN:     upload quota drift corrected: reserved_bytes %d -> %d (SUM(file_size) of active unreleased sessions)",
+		a.logger.Printf("WARN:     upload quota drift corrected: reserved_bytes %d -> %d (SUM(file_size) of sessions still holding a reservation: quota_released = 0)",
 			previous, recomputed)
 		return
 	}

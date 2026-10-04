@@ -32,13 +32,16 @@
 测试：`TestFailCompleteKeepsQuotaReservationUntilTerminal`（repo）、
 `TestQuotaHeldAfterCompleteRollback`（api，含 `RecomputeUploadQuota` 对账）。
 
-### 2.2 过期清理可能删除「正在合并」的 staged 文件
+### 2.2 过期清理可能删除「正在 COMPLETE」的容器
 
-`PurgeExpiredUploads` 原先不带状态过滤。若 TTL 恰好在组装过程中到期，清理线程会删掉行并
+`PurgeExpiredUploads` 原先不带状态过滤。若 TTL 恰好在 COMPLETE 期间到期，清理线程会删掉行并
 `os.Remove(staged_path)`，随后 clip 插入成功 → clip 指向一个已被 unlink 的文件（下载报
-「文件已丢失」）。修复：清理跳过 `completing` 行（与 `AbortUploadSession` 的拒绝语义一致）；
-合并失败会回滚为 `active`，下一次清理即可回收，进程崩溃的场景由启动恢复兜底。
-测试：`TestPurgeExpiredUploadsSkipsCompleting`。
+「文件已丢失」）。修复（本分支已改）：清理对 `completing` 行给**宽限期保护**而不是永久跳过——
+新实现里分块在 PUT 阶段就落盘并 fsync，COMPLETE 不再做文件 IO，`completing` 只是毫秒级并发闸门，
+永久跳过会让被硬杀残留的行**一直占着预留**（账本里它的字节仍然有效），所以超过
+`CompletingPurgeGraceSeconds`（900s）就回收；仍在宽限期内（可能是进行中的 clip INSERT）则保护。
+见 `docs/upload-quota.md` §4.1。
+测试：`TestPurgeExpiredUploadsSkipsCompleting`（保护）、`TestPurgeReclaimsStaleCompletingAfterGrace`（回收）。
 
 ### 2.3 init 幂等重放可能返回「不可用的 session」
 
