@@ -80,6 +80,10 @@ Vite 开发服务器场景下把后端改到 5174，再 `BACKEND_PORT=5174 npm r
 | `SUPER_CLIPBOARD_CAPTCHA_SITE_KEY` | 空 | 下发给前端的 site key |
 | `SUPER_CLIPBOARD_CAPTCHA_BYPASS_TOKEN` | 空 | 仅测试用的直通 Token |
 | `SUPER_CLIPBOARD_CAPTCHA_TIMEOUT_SECONDS` | `6.0` | 验证码校验超时 |
+| `SUPER_CLIPBOARD_UPLOAD_TOTAL_QUOTA_BYTES` | `10737418240`（10GiB） | 活动上传会话已预留字节上限，`0` = 不限 |
+| `SUPER_CLIPBOARD_MAX_ACTIVE_UPLOAD_SESSIONS` | `1000` | 并发活动上传会话上限，`0` = 不限 |
+| `SUPER_CLIPBOARD_MIN_FREE_DISK_BYTES` | `1073741824`（1GiB） | 可用磁盘水位，低于则拒绝写入，`0` = 不限 |
+| `SUPER_CLIPBOARD_STORED_TOTAL_QUOTA_BYTES` | `10737418240`（10GiB） | 已保存片段文件总大小上限（`SUM(clips.file_size)`），`0` = 不限 |
 
 同时支持工作目录下的 `.env` 文件；真实环境变量优先级高于 `.env`（与 pydantic-settings 一致）。
 
@@ -91,7 +95,7 @@ Vite 开发服务器场景下把后端改到 5174，再 `BACKEND_PORT=5174 npm r
 | `GET /` | 有 `dist/index.html` 则返回前端，否则返回 `{name, ok}` | 200 | — |
 | `GET /static/{path}` `GET /assets/{path}` | 前端静态资源（目录存在时才挂载） | 200 | 404 `Not Found` |
 | `GET /api/clips?environmentId=` | 列出当前设备的片段（先执行一次清理） | 200 `{items:[...]}` | 400 `environmentId 缺失` / 422 |
-| `POST /api/clips` | 创建文本或文件片段 | 201 `ClipResponse` | 400 / 409 / 422 / 500 |
+| `POST /api/clips` | 创建文本或文件片段 | 201 `ClipResponse` | 400 / 409 / 422 / 500 / 507 `存储配额不足` |
 | `GET /api/clips/{clip_id}?environmentId=` | 读取片段 | 200 | 404 `片段未找到`、404 `片段已过期或达到下载次数` |
 | `GET /api/clips/code/{access_code}` | 按短码读取片段 | 200 | 404 `直链不存在或已过期` |
 | `DELETE /api/clips/{clip_id}?environmentId=` | 删除片段及其文件 | 200 `{ok:true}` | 404 `片段未找到` |

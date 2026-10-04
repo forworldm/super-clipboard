@@ -48,6 +48,12 @@ type Settings struct {
 	UploadTotalQuotaBytes   int64 // total bytes reserved by live upload sessions
 	MaxActiveUploadSessions int   // max concurrently active upload sessions
 	MinFreeDiskBytes        int64 // free-space watermark below which writes stop
+	// StoredTotalQuotaBytes bounds the bytes of clips that are ALREADY saved
+	// (SUM(file_size) over the clips table). It is charged when a clip row is
+	// inserted and returned when one is deleted, so it converges to the
+	// configured budget instead of policing in-flight upload traffic
+	// (UploadTotalQuotaBytes does that). 0 = unlimited.
+	StoredTotalQuotaBytes int64
 	// Warnings collects non-fatal configuration findings (surfaced at startup).
 	Warnings []string
 }
@@ -58,6 +64,12 @@ const (
 	DefaultUploadTotalQuotaBytes   int64 = 10 << 30 // 10 GiB
 	DefaultMaxActiveUploadSessions       = 1000
 	DefaultMinFreeDiskBytes        int64 = 1 << 30 // 1 GiB
+
+	// DefaultStoredTotalQuotaBytes is the shipped ceiling for saved clip bytes,
+	// i.e. the bytes that survive in clips.file_path forever (or until their TTL
+	// expires). It sits above DefaultMaxFileSizeBytes so a single allowed file
+	// always fits into an empty store.
+	DefaultStoredTotalQuotaBytes int64 = 10 << 30 // 10 GiB
 )
 
 // Defaults returns the same defaults as the Python Settings class.
@@ -79,6 +91,7 @@ func Defaults() *Settings {
 		UploadTotalQuotaBytes:   DefaultUploadTotalQuotaBytes,
 		MaxActiveUploadSessions: DefaultMaxActiveUploadSessions,
 		MinFreeDiskBytes:        DefaultMinFreeDiskBytes,
+		StoredTotalQuotaBytes:   DefaultStoredTotalQuotaBytes,
 	}
 }
 
@@ -143,6 +156,15 @@ func (s *Settings) EffectiveMinFreeDiskBytes() int64 {
 		return 0
 	}
 	return s.MinFreeDiskBytes
+}
+
+// EffectiveStoredQuota returns the saved-clip byte budget (0 = unlimited).
+// Hand-built Settings in tests may carry negatives; treat them as "off".
+func (s *Settings) EffectiveStoredQuota() int64 {
+	if s == nil || s.StoredTotalQuotaBytes <= 0 {
+		return 0
+	}
+	return s.StoredTotalQuotaBytes
 }
 
 // CaptchaEnabled reports whether a captcha provider is configured.
@@ -260,6 +282,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		func() error { return int64Var("UPLOAD_TOTAL_QUOTA_BYTES", &s.UploadTotalQuotaBytes) },
 		func() error { return intVar("MAX_ACTIVE_UPLOAD_SESSIONS", &s.MaxActiveUploadSessions) },
 		func() error { return int64Var("MIN_FREE_DISK_BYTES", &s.MinFreeDiskBytes) },
+		func() error { return int64Var("STORED_TOTAL_QUOTA_BYTES", &s.StoredTotalQuotaBytes) },
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -275,6 +298,7 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		{"UPLOAD_TOTAL_QUOTA_BYTES", s.UploadTotalQuotaBytes},
 		{"MAX_ACTIVE_UPLOAD_SESSIONS", int64(s.MaxActiveUploadSessions)},
 		{"MIN_FREE_DISK_BYTES", s.MinFreeDiskBytes},
+		{"STORED_TOTAL_QUOTA_BYTES", s.StoredTotalQuotaBytes},
 	}
 	for _, guard := range negativeGuard {
 		if guard.value < 0 {
@@ -288,6 +312,13 @@ func LoadFrom(environ []string, envFilePath string) (*Settings, error) {
 		s.Warnings = append(s.Warnings, fmt.Sprintf(
 			"%sUPLOAD_TOTAL_QUOTA_BYTES (%d bytes) < %sMAX_FILE_SIZE_BYTES (%d bytes): 接近上限的单文件将无法开始上传",
 			EnvPrefix, s.UploadTotalQuotaBytes, EnvPrefix, s.MaxFileSizeBytes))
+	}
+	// Same smell for the saved-clip budget: a file that is individually allowed
+	// can never be persisted when the store is too small for it.
+	if s.StoredTotalQuotaBytes > 0 && s.MaxFileSizeBytes > 0 && s.StoredTotalQuotaBytes < s.MaxFileSizeBytes {
+		s.Warnings = append(s.Warnings, fmt.Sprintf(
+			"%sSTORED_TOTAL_QUOTA_BYTES (%d bytes) < %sMAX_FILE_SIZE_BYTES (%d bytes): 接近上限的单文件将无法保存",
+			EnvPrefix, s.StoredTotalQuotaBytes, EnvPrefix, s.MaxFileSizeBytes))
 	}
 
 	// Clamp chunked-upload knobs so a bad env cannot break the protocol.

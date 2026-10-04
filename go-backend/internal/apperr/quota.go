@@ -15,6 +15,11 @@ const (
 	StorageCodeSessionLimit StorageCode = "upload_session_limit"
 	// StorageCodeDisk means free disk dropped below MinFreeDiskBytes.
 	StorageCodeDisk StorageCode = "disk_watermark"
+	// StorageCodeClipQuota means the bytes of the clip being inserted would push
+	// SUM(clips.file_size) past StoredTotalQuotaBytes. It is raised while the
+	// clip row is written (CAS on the clip_quota ledger), so a refused clip is
+	// never persisted and its file is removed by the caller.
+	StorageCodeClipQuota StorageCode = "stored_clip_quota_exceeded"
 )
 
 // StorageError is the typed error behind every 507 answer of the chunked

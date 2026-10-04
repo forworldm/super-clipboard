@@ -311,8 +311,11 @@ func (a *App) cleanupWorker(ctx context.Context) {
 			// DELETE, network drop, browser closed mid-upload).
 			a.purgeExpiredUploadsPeriodic()
 			// Quota reconciliation: rebuild upload_quota.reserved_bytes from the
-			// sessions that should still hold a reservation, repairing drift.
+			// sessions that should still hold a reservation, and clip_quota.
+			// used_bytes from the clips that are actually stored, repairing
+			// drift on both ledgers.
 			a.reconcileUploadQuota()
+			a.reconcileClipQuota()
 		}
 	}
 }

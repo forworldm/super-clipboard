@@ -93,6 +93,17 @@ var createTableStatements = []string{
 		reserved_bytes INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL DEFAULT 0
 	)`,
+	// clip_quota is the matching single-row ledger (id=1) for bytes that are
+	// ALREADY saved: the sum of clips.file_size. It is charged inside the clip
+	// INSERT transaction and returned inside every clip DELETE transaction.
+	`CREATE TABLE IF NOT EXISTS clip_quota (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		used_bytes INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`,
+	// clips.file_size drives both the ledger and its repairs; keep the lookup
+	// cheap for large installations.
+	`CREATE INDEX IF NOT EXISTS idx_clips_file_size ON clips(file_size)`,
 }
 
 // uploadQuotaSeedRow creates the single ledger row for databases that predate
@@ -101,6 +112,20 @@ var createTableStatements = []string{
 const uploadQuotaSeedRow = `INSERT INTO upload_quota (id, reserved_bytes, updated_at)
 	SELECT 1, COALESCE(SUM(file_size), 0), strftime('%s','now')
 	FROM upload_sessions WHERE status = 'active' AND quota_released = 0
+	ON CONFLICT(id) DO NOTHING`
+
+// clipQuotaSeedRow creates the single ledger row for databases that predate the
+// stored-clip quota (or for one whose row was deleted by hand). The starting
+// balance is the SUM(file_size) of the clips that are actually stored -- the
+// convergent value -- so an upgrade never grants free credit and never forgets
+// the bytes that are already on disk. Text clips carry a NULL file_size and
+// therefore consume nothing.
+// The trailing `WHERE 1` is required: without a WHERE clause SQLite parses the
+// ON CONFLICT of an INSERT ... SELECT as part of the SELECT's join constraint
+// and fails with a syntax error (same reason uploadQuotaSeedRow filters).
+const clipQuotaSeedRow = `INSERT INTO clip_quota (id, used_bytes, updated_at)
+	SELECT 1, COALESCE(SUM(file_size), 0), strftime('%s','now')
+	FROM clips WHERE 1
 	ON CONFLICT(id) DO NOTHING`
 
 // uploadRequestIDIndex enforces init idempotency on (environment_id,
@@ -272,6 +297,12 @@ func (r *ClipRepository) ensureSchema() error {
 	}
 	// upload_quota single row (id=1); created above, seeded once here.
 	if _, err := r.db.Exec(uploadQuotaSeedRow); err != nil {
+		return fmt.Errorf("unable to migrate schema: %w", err)
+	}
+	// clip_quota single row (id=1); created above, seeded from the clips that
+	// already exist. Idempotent: ON CONFLICT(id) DO NOTHING keeps a live
+	// ledger untouched on every restart.
+	if _, err := r.db.Exec(clipQuotaSeedRow); err != nil {
 		return fmt.Errorf("unable to migrate schema: %w", err)
 	}
 	return nil
@@ -602,6 +633,20 @@ func (r *ClipRepository) CreateClip(params CreateClipParams) (*models.Clip, erro
 		fileMime = params.StoredFile.Mime
 	}
 
+	// Stored-clip quota: charge the saved bytes to the single-row ledger with a
+	// CAS inside the very same transaction as the INSERT, so a clip is only
+	// persisted when the ledger can pay for it. Text clips carry no file and
+	// therefore no charge; the CAS plus the shared transaction make the charge
+	// atomic (a failed INSERT -- duplicate access code, crash -- rolls the
+	// ledger back with it).
+	storedBytes := int64(0)
+	if params.StoredFile != nil {
+		storedBytes = params.StoredFile.Size
+	}
+	if err := r.reserveClipQuotaTx(tx, storedBytes, r.settings.EffectiveStoredQuota()); err != nil {
+		return nil, err
+	}
+
 	if _, err := tx.Exec(`INSERT INTO clips (
 			id, type, created_at, expires_at, max_downloads,
 			download_count, access_code, access_token, owner_id, text_content,
@@ -789,9 +834,10 @@ func (r *ClipRepository) DeleteClip(clipID string, environmentID string) (bool, 
 		var (
 			storedPath sql.NullString
 			ownerID    string
+			fileSize   sql.NullInt64
 		)
-		row := tx.QueryRow("SELECT file_path, owner_id FROM clips WHERE id = ?", clipID)
-		if err := row.Scan(&storedPath, &ownerID); err != nil {
+		row := tx.QueryRow("SELECT file_path, owner_id, file_size FROM clips WHERE id = ?", clipID)
+		if err := row.Scan(&storedPath, &ownerID, &fileSize); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return sql.ErrNoRows
 			}
@@ -800,7 +846,23 @@ func (r *ClipRepository) DeleteClip(clipID string, environmentID string) (bool, 
 		if ownerID != normalizedEnv {
 			return sql.ErrNoRows
 		}
-		if _, err := tx.Exec("DELETE FROM clips WHERE id = ?", clipID); err != nil {
+		res, err := tx.Exec("DELETE FROM clips WHERE id = ?", clipID)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			// A concurrent process removed the row first (it owns the release).
+			return sql.ErrNoRows
+		}
+		// The saved bytes leave with the row: return exactly what the INSERT
+		// charged (NULL/0 for text clips, and for rows written before the
+		// ledger existed). Same transaction, so the ledger can never drift
+		// from the clips table on this path.
+		if err := r.releaseClipQuotaTx(tx, fileSize.Int64); err != nil {
 			return err
 		}
 		filePath = storedPath.String
@@ -879,7 +941,28 @@ func (r *ClipRepository) PurgeInactive() (int, error) {
 		return 0, err
 	}
 	for _, victim := range victims {
-		if _, err := tx.Exec("DELETE FROM clips WHERE id = ?", victim.id); err != nil {
+		res, err := tx.Exec("DELETE FROM clips WHERE id = ?", victim.id)
+		if err != nil {
+			_ = tx.Rollback()
+			r.mu.Unlock()
+			return 0, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			r.mu.Unlock()
+			return 0, err
+		}
+		if affected != 1 {
+			// Already removed by someone else (which released the bytes): do
+			// not return the same charge twice.
+			continue
+		}
+		// Every purged clip returns its saved bytes, in the same transaction as
+		// its DELETE: expiry cleanup, the download-limit sweep and the startup
+		// purge all share this loop, so the ledger stays in sync with the table
+		// no matter which trigger removed the row.
+		if err := r.releaseClipQuotaTx(tx, victim.fileSize); err != nil {
 			_ = tx.Rollback()
 			r.mu.Unlock()
 			return 0, err
@@ -902,11 +985,14 @@ func (r *ClipRepository) PurgeInactive() (int, error) {
 type pendingPurge struct {
 	id       string
 	filePath string
+	// fileSize is the byte charge of the clip, returned to the clip_quota
+	// ledger when the row is deleted.
+	fileSize int64
 }
 
 func (r *ClipRepository) collectInactive(now int64) ([]pendingPurge, error) {
 	rows, err := r.db.Query(
-		"SELECT id, file_path FROM clips WHERE expires_at <= ? OR download_count >= max_downloads",
+		"SELECT id, file_path, file_size FROM clips WHERE expires_at <= ? OR download_count >= max_downloads",
 		now,
 	)
 	if err != nil {
@@ -919,11 +1005,12 @@ func (r *ClipRepository) collectInactive(now int64) ([]pendingPurge, error) {
 		var (
 			id       string
 			filePath sql.NullString
+			fileSize sql.NullInt64
 		)
-		if err := rows.Scan(&id, &filePath); err != nil {
+		if err := rows.Scan(&id, &filePath, &fileSize); err != nil {
 			return nil, err
 		}
-		victims = append(victims, pendingPurge{id: id, filePath: filePath.String})
+		victims = append(victims, pendingPurge{id: id, filePath: filePath.String, fileSize: fileSize.Int64})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

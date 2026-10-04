@@ -1010,6 +1010,9 @@ func (a *App) ReconcileUploadsOnStartup() {
 	// 6) Upload quota ledger: an upgrade from a pre-quota database (or a crash
 	// between "reserve" and "insert") may leave the counter drifting.
 	a.reconcileUploadQuota()
+	// 7) Stored-clip ledger: an upgrade from a pre-quota database (or a crash
+	// between "charge" and "commit") may leave the saved-bytes counter drifting.
+	a.reconcileClipQuota()
 }
 
 // reconcileUploadQuota recomputes the reserved bytes from live sessions and
@@ -1027,6 +1030,27 @@ func (a *App) reconcileUploadQuota() {
 		return
 	}
 	a.logger.Printf("INFO:     upload quota reconciled: reserved_bytes = %d (no drift)", recomputed)
+}
+
+// reconcileClipQuota recomputes the saved-clip bytes from the clips table and
+// overwrites the ledger, then logs the result. It only fixes the counter -- no
+// clip and no file is touched.
+//
+// Charge and release always ride along with the clip INSERT/DELETE transaction,
+// so this is a belt-and-braces repair for drift left by an upgrade or a crash;
+// it can never grant credit that the clips table does not back.
+func (a *App) reconcileClipQuota() {
+	recomputed, previous, err := a.Repo.RecomputeClipQuota()
+	if err != nil {
+		a.logger.Printf("ERROR:    clip storage quota reconciliation failed: %v", err)
+		return
+	}
+	if recomputed != previous {
+		a.logger.Printf("WARN:     clip storage quota drift corrected: used_bytes %d -> %d (SUM(file_size) of stored clips)",
+			previous, recomputed)
+		return
+	}
+	a.logger.Printf("INFO:     clip storage quota reconciled: used_bytes = %d (no drift)", recomputed)
 }
 
 // purgeExpiredUploadsPeriodic is called by the cleanup worker (timeout path).
