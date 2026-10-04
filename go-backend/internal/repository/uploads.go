@@ -284,6 +284,12 @@ func (r *ClipRepository) GetUploadSessionByRequestID(environmentID string, reque
 	return session, nil
 }
 
+// maxInitAttempts bounds the idempotency retries of CreateOrGetUploadSession.
+// The first attempt is the normal path; the remaining ones only ever run after
+// the insert lost a race on the (environment_id, request_id) UNIQUE index, so
+// the INSERT executes at most maxInitAttempts times per call.
+const maxInitAttempts = 3
+
 // CreateOrGetUploadSession implements idempotent init on (env, requestID):
 //   - a live session for the key is returned with created=false (replay);
 //   - an expired session for the key is purged and replaced with a fresh one;
@@ -291,10 +297,19 @@ func (r *ClipRepository) GetUploadSessionByRequestID(environmentID string, reque
 //
 // Two parallel inits race on the partial UNIQUE index: the loser re-reads the
 // winner's row and returns it, so exactly one session consumes the key.
+//
+// Losing that race is RETRIED (bounded by maxInitAttempts) rather than failing
+// the request: the loop head re-reads the key, so a retry either replays the
+// winner or -- when the winner vanished between our failed insert and the retry
+// (the cleanup worker purged an expired row) -- publishes this session and wins
+// the key itself. Only a UNIQUE violation with a requestID set is retryable;
+// every other outcome (validation error, DB/IO error, an expired key whose row
+// cannot be purged yet because it is mid-merge) returns immediately, so the loop
+// can never spin on a permanent condition.
 func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionParams) (session *UploadSession, created bool, err error) {
 	requestID := strings.TrimSpace(params.RequestID)
 	env := strings.TrimSpace(params.EnvironmentID)
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxInitAttempts; attempt++ {
 		if requestID != "" {
 			existing, lookupErr := r.GetUploadSessionByRequestID(env, requestID)
 			if lookupErr != nil {
@@ -308,7 +323,8 @@ func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionPara
 				// reuse the index slot. File cleanup happens outside the repo.
 				// An in-flight merge (`completing`) refuses to be aborted, and
 				// then the key is still taken -- report it instead of replaying a
-				// dead session (its /complete would only ever 409/410).
+				// dead session (its /complete would only ever 409/410). This is a
+				// permanent condition, not a race: do not retry it.
 				if _, abortErr := r.AbortUploadSession(existing.ID); abortErr != nil &&
 					!errors.Is(abortErr, sql.ErrNoRows) {
 					return nil, false, &SessionUnavailableError{Session: existing}
@@ -323,14 +339,20 @@ func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionPara
 		if insertErr == nil {
 			return fresh, true, nil
 		}
-		if requestID != "" && isUniqueConstraintError(insertErr) {
-			// Lost the insert race: read the winner (an expired-but-unpurgeable
-			// winner is reported, never replayed).
-			return r.replayExistingSession(env, requestID)
+		if requestID == "" || !isUniqueConstraintError(insertErr) {
+			// No idempotency key to dedup on, or a genuine failure: surface it.
+			return nil, false, insertErr
 		}
-		return nil, false, insertErr
+		// Lost the insert race on (env, requestID): retry. Nothing was persisted
+		// by the failed insert (no session row, no chunks), so the next
+		// iteration re-reads the key and either replays the winner or creates the
+		// session itself.
 	}
-	// Should be unreachable for bounded retries; treat as replay of the winner.
+	// The retries were exhausted, which means another init (or a purge) keeps
+	// taking or dropping the key in between: report the state of the key instead
+	// of guessing -- replay of the winner, SessionUnavailableError for an
+	// expired-but-unpurgeable winner, or a clear idempotency conflict when no
+	// row carries the key anymore.
 	return r.replayExistingSession(env, requestID)
 }
 

@@ -2,13 +2,13 @@
 
 审查对象：`go-backend/internal/{api/uploads.go, repository/uploads.go, repository/quota.go, storage/chunks.go}`
 与前端 `src/utils/uploads.ts`。结论：**主流程正确**，并发路径由「短事务 + CAS SQL + 文件原子 rename」保证；
-发现 3 处实质问题与 3 处理论风险，前 3 处已修复并补测试。
+发现 4 处实质问题（含 2.4 前端、2.5 init 重试死代码）与 3 处理论风险，实质问题均已修复并补测试。
 
 ## 1. 并发模型（现状核对）
 
 | 步骤 | 并发手段 | 结论 |
 | --- | --- | --- |
-| `POST /api/uploads/init` | 配额/会话数/磁盘水位三门禁 + `(environment_id, request_id)` 部分唯一索引 + 唯一冲突后重读 | 竞态下只有一个 session 建立，配额 CAS（`reserved_bytes + ? <= ?`）不会超卖 |
+| `POST /api/uploads/init` | 配额/会话数/磁盘水位三门禁 + `(environment_id, request_id)` 部分唯一索引 + 唯一冲突后有界重试（重读赢家或自己占用键槽，见 2.5） | 竞态下只有一个 session 建立，配额 CAS（`reserved_bytes + ? <= ?`）不会超卖 |
 | `PUT .../chunks/{index}` | 先写临时文件再 `rename`（原子），随后短事务 upsert 收据；无全局锁包住文件 IO | 重传幂等；并发 PUT 之间不互相破坏 |
 | `POST .../complete` | `TryBeginComplete`：`UPDATE ... WHERE status='active'`（CAS）抢占 `active→completing`；组装在锁外 | 并发 complete 只有一个能进入合并，其余 409/200 重放 |
 | 取消 / 过期 | `AbortUploadSession` 拒绝 `completing`；`PurgeExpiredUploads` 幂等归还配额 | 不会拆掉进行中的合并 |
@@ -56,6 +56,54 @@ resume 槽——用户换个短码重试会重放旧 session，永远 409。
 修复：`buildResumeKey` 纳入 accessCode / token 指纹；`isUnrecoverableCompleteFailure`
 （409/410/无 `missing` 的 400）会 best-effort `DELETE` 掉回滚后的 session 并清除 resume 状态，
 而分片缺失（带 `missing` 的 400）与网络抖动仍保持可续传。
+
+### 2.5 `CreateOrGetUploadSession` 的重试循环形同虚设（死代码 + 可恢复的 init 被丢弃）
+
+审查发现的第 4 处实质问题：`CreateOrGetUploadSession` 里的
+`for attempt := 0; attempt < 3; attempt++` **循环体每一条分支都会 `return`**，
+因此循环永远只跑一轮：
+
+* 它不是「无限循环」类 bug —— 控制流是有界的，既有测试（含
+  `TestInitReplayRefusesStaleInFlightSession`）覆盖的行为全部正确；
+* 但它**谎报了重试语义**：循环写法 + 循环外那句 “Should be unreachable for bounded
+  retries” 都暗示存在重试，实际不存在。代码与注释互相矛盾，属可维护性缺陷。
+
+同时它掩盖了一个真实（罕见）的失败窗口：唯一索引冲突后旧实现直接调用
+`replayExistingSession`——如果赢家在「我方插入失败」与「重读」之间消失了
+（清理 worker 恰好回收了已过期的赢家），重读拿不到任何行，于是整个 init 以
+`unable to create upload session (idempotency conflict)` 失败（API 层 500），
+**尽管此刻重新插入一定能成功**。
+
+修复：把循环变成它本来应该代表的东西 —— 有界重试（`maxInitAttempts = 3`）：
+
+```go
+for attempt := 0; attempt < maxInitAttempts; attempt++ {
+    // ... 读键：命中存活赢家 → 直接重放（return）
+    // ... 过期键：先回收（无法回收则立即 SessionUnavailableError，不重试）
+    // ... 插入：成功 → return；非唯一索引错误 / 无 requestId → return
+    // 仅当「插入因 UNIQUE 冲突失败且带 requestId」才进入下一轮：
+    // 下一轮重新读键，于是要么重放赢家，要么自己插入成功并占用键槽
+}
+return r.replayExistingSession(env, requestID) // 重试耗尽：按键的当前归属上报
+```
+
+只有「UNIQUE 冲突 + 有 requestId」可重试；校验错误、DB/IO 错误、以及处于 `completing`
+的过期赢家（永久条件）一律立即返回，因此循环不会空转，`INSERT` 最多执行
+`maxInitAttempts` 次。
+
+测试（`internal/repository/uploads_init_test.go`，用 SQLite 触发器确定性地复现竞态前
+提，`RAISE(FAIL)` 能在语句中止的同时保留触发器自身的写入）：
+
+| 用例 | 断言 |
+| --- | --- |
+| `TestCreateOrGetUploadSessionRetriesTransientUniqueConflict` | 首次插入被 UNIQUE 冲突拒绝且键槽为空 → 重试后 `created=true`、只有 1 行 session、键可用；再次调用走重放（不再插入） |
+| `TestCreateOrGetUploadSessionRetryReplaysWinner` | 首次插入冲突时并发赢家出现 → 重试返回**赢家**（`created=false`、id 为赢家 id），键槽仍只有 1 行 |
+| `TestCreateOrGetUploadSessionRetriesAreBounded` | 永久冲突时恰好尝试 `maxInitAttempts` 次后返回错误，不空转，仓库保持可用 |
+| `TestCreateOrGetUploadSessionNonRetryableErrorsReturnImmediately` | 非 UNIQUE 失败只尝试 1 次；`completing` 过期赢家立即返回 `SessionUnavailableError` |
+
+回归证据：把函数体临时还原成「死循环」版本后，
+`RetriesTransientUniqueConflict` 报 `unable to create upload session (idempotency conflict)`、
+`RetriesAreBounded` 报 `got 1` 次尝试 —— 均按预期失败，证明测试确实锁住了这次修复。
 
 ## 3. 新增的竞态探针
 
