@@ -144,9 +144,11 @@ func TestStoredQuotaChargedAndReleasedThroughTheAPI(t *testing.T) {
 }
 
 // TestStoredQuotaRefusalAtComplete507 pins the refusal contract of the chunked
-// upload path: HTTP 507, a typed detail, no clip, no ledger movement, the staged
-// file removed and the session still resumable. Deleting the clip that owns the
-// bytes makes the very same upload succeed -- the budget converges.
+// upload path: HTTP 507, a typed detail, no clip, no ledger movement, the
+// pre-allocated container kept (the bytes already sit in their final position,
+// so a rollback has nothing to copy or discard) and the session still resumable.
+// Deleting the clip that owns the bytes makes the very same upload succeed -- the
+// budget converges; only THEN does the second container stop being extra space.
 func TestStoredQuotaRefusalAtComplete507(t *testing.T) {
 	app := newTestApp(t, storedQuotaSettings(200))
 	env := "env-refuse"
@@ -167,8 +169,11 @@ func TestStoredQuotaRefusalAtComplete507(t *testing.T) {
 	if got := storedValue(t, app); got != 150 {
 		t.Fatalf("a refused clip must not move the ledger: %d", got)
 	}
-	if count := storedFileCount(t, app); count != 1 {
-		t.Fatalf("the refused upload must not leave a staged file: %d files", count)
+	// Two containers exist: the completed clip's file and the rolled-back
+	// session's pre-allocated file (kept so the retry can finish without
+	// re-uploading, exactly like the old chunk files were kept).
+	if count := storedFileCount(t, app); count != 2 {
+		t.Fatalf("the refused upload must keep exactly its own container: %d files", count)
 	}
 	listed := do(t, app, http.MethodGet, "/api/clips?environmentId="+env, nil)
 	requireStatus(t, listed, http.StatusOK)
@@ -198,6 +203,10 @@ func TestStoredQuotaRefusalAtComplete507(t *testing.T) {
 	requireStatus(t, retry, http.StatusCreated)
 	if got := storedValue(t, app); got != 150 {
 		t.Fatalf("used = %d, want 150 after the retry", got)
+	}
+	// The retried complete needed no copy: one container per surviving clip.
+	if count := storedFileCount(t, app); count != 1 {
+		t.Fatalf("expected exactly the retried clip's file, got %d", count)
 	}
 }
 
@@ -417,7 +426,10 @@ func TestStoredQuotaConcurrentCompletesNoOversell(t *testing.T) {
 	if items := decode(t, listed)["items"].([]interface{}); len(items) != 2 {
 		t.Fatalf("expected 2 stored clips, got %d", len(items))
 	}
-	if count := storedFileCount(t, app); count != 2 {
-		t.Fatalf("expected 2 files on disk, got %d", count)
+	// 4 containers: the 2 clips that won own 2 files, and the 2 refused sessions
+	// keep their own pre-allocated file for a possible retry (no copy was made
+	// for the winners, which is what used to double the disk usage).
+	if count := storedFileCount(t, app); count != 4 {
+		t.Fatalf("expected 2 clip files + 2 kept containers, got %d", count)
 	}
 }

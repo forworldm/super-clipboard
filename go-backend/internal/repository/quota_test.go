@@ -247,7 +247,7 @@ func TestUploadQuotaReleasedOnComplete(t *testing.T) {
 			t.Fatalf("mark chunk: %v", err)
 		}
 	}
-	completing, _, err := repo.TryBeginComplete(session.ID, filepath.Join(t.TempDir(), "done.bin"))
+	completing, _, err := repo.TryBeginComplete(session.ID)
 	if err != nil {
 		t.Fatalf("begin complete: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestFailCompleteKeepsReservationUntilTerminal(t *testing.T) {
 	if err := repo.MarkChunkReceived(session.ID, 0, 512); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := repo.TryBeginComplete(session.ID, filepath.Join(t.TempDir(), "fail.bin")); err != nil {
+	if _, _, err := repo.TryBeginComplete(session.ID); err != nil {
 		t.Fatalf("begin complete: %v", err)
 	}
 	if _, err := repo.FailComplete(session.ID); err != nil {

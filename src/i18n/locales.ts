@@ -320,7 +320,8 @@ const zhCN: TranslationDictionary = {
     const { index, attempt, max } = toUploadRetry(params);
     return `分片 ${index} 上传失败，正在重试（${attempt}/${max}）…`;
   },
-  "upload.assembling": "正在合并文件…",
+  "upload.restarting": "服务端已重置接收记录，正在重新上传缺失分片…",
+  "upload.finalizing": "分片已全部写入，正在生成下载链接…",
   "upload.cancel": "取消上传",
   "upload.cancelling": "正在取消…",
   "upload.cancelled": "上传已取消",
@@ -335,7 +336,7 @@ const zhCN: TranslationDictionary = {
   },
   "upload.completeFailed": (params) => {
     const { reason } = toReason(params);
-    return `文件合并失败：${reason}`;
+    return `生成下载链接失败：${reason}`;
   },
   "toast.uploadCancelled": "文件上传已取消",
   "toast.uploadFailed": (params) => {
@@ -344,6 +345,10 @@ const zhCN: TranslationDictionary = {
   },
   "toast.uploadTimeout": "上传超时，请检查网络后重试",
   "toast.uploadSessionExpired": "上传会话已过期，请重新选择文件上传",
+  "toast.uploadStorageExceeded": (params) => {
+    const { reason } = toReason(params);
+    return `存储空间不足：${reason}`;
+  },
   "buttons.cancelUpload": "取消上传",
   "buttons.retryUpload": "重试上传"
 };
@@ -554,7 +559,8 @@ const en: TranslationDictionary = {
     const { index, attempt, max } = toUploadRetry(params);
     return `Chunk ${index} failed, retrying (${attempt}/${max})…`;
   },
-  "upload.assembling": "Assembling file…",
+  "upload.restarting": "Server reset its receipts, re-sending the missing ranges…",
+  "upload.finalizing": "All ranges written, creating the download link…",
   "upload.cancel": "Cancel upload",
   "upload.cancelling": "Cancelling…",
   "upload.cancelled": "Upload cancelled",
@@ -569,7 +575,7 @@ const en: TranslationDictionary = {
   },
   "upload.completeFailed": (params) => {
     const { reason } = toReason(params);
-    return `Failed to assemble file: ${reason}`;
+    return `Failed to finalize the upload: ${reason}`;
   },
   "toast.uploadCancelled": "File upload cancelled.",
   "toast.uploadFailed": (params) => {
@@ -578,6 +584,10 @@ const en: TranslationDictionary = {
   },
   "toast.uploadTimeout": "Upload timed out. Check your connection and retry.",
   "toast.uploadSessionExpired": "Upload session expired. Please reselect the file.",
+  "toast.uploadStorageExceeded": (params) => {
+    const { reason } = toReason(params);
+    return `Storage limit reached: ${reason}`;
+  },
   "buttons.cancelUpload": "Cancel upload",
   "buttons.retryUpload": "Retry upload"
 };
@@ -786,7 +796,8 @@ const ja: TranslationDictionary = {
     const { index, attempt, max } = toUploadRetry(params);
     return `チャンク ${index} に失敗しました。再試行中（${attempt}/${max}）…`;
   },
-  "upload.assembling": "ファイルを結合中…",
+  "upload.restarting": "サーバー側の受信記録がリセットされました。不足分を再送信しています…",
+  "upload.finalizing": "全チャンクの書き込みが完了しました。ダウンロードリンクを生成しています…",
   "upload.cancel": "アップロードをキャンセル",
   "upload.cancelling": "キャンセル中…",
   "upload.cancelled": "アップロードをキャンセルしました",
@@ -801,7 +812,7 @@ const ja: TranslationDictionary = {
   },
   "upload.completeFailed": (params) => {
     const { reason } = toReason(params);
-    return `ファイルの結合に失敗しました: ${reason}`;
+    return `ダウンロードリンクの生成に失敗しました: ${reason}`;
   },
   "toast.uploadCancelled": "ファイルのアップロードをキャンセルしました。",
   "toast.uploadFailed": (params) => {
@@ -810,6 +821,10 @@ const ja: TranslationDictionary = {
   },
   "toast.uploadTimeout": "アップロードがタイムアウトしました。接続を確認して再試行してください。",
   "toast.uploadSessionExpired": "アップロードセッションの期限が切れました。ファイルを選択し直してください。",
+  "toast.uploadStorageExceeded": (params) => {
+    const { reason } = toReason(params);
+    return `ストレージ上限に達しました: ${reason}`;
+  },
   "buttons.cancelUpload": "アップロードをキャンセル",
   "buttons.retryUpload": "再試行"
 };

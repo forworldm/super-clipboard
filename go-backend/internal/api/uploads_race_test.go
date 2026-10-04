@@ -30,7 +30,7 @@ func TestInitReplayStaleInFlightIsConflict(t *testing.T) {
 	if err := app.Repo.MarkChunkReceived(uploadID, 0, 1024); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := app.Repo.TryBeginComplete(uploadID, app.Settings.FileStorageDir+"/stale-staged.bin"); err != nil {
+	if _, _, err := app.Repo.TryBeginComplete(uploadID); err != nil {
 		t.Fatalf("begin complete: %v", err)
 	}
 	if err := app.Repo.SetUploadExpiryForTest(uploadID, time.Now().Add(-time.Minute).Unix()); err != nil {

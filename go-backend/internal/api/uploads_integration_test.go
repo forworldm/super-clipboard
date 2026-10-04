@@ -94,9 +94,13 @@ func TestResumeAcrossServerRestart(t *testing.T) {
 	if len(missing) != 1 || missing[0] != float64(1) {
 		t.Fatalf("restart lost progress, missing=%v", missing)
 	}
-	// Old chunk bytes survive on disk after restart.
-	if got, err := os.ReadFile(storage.ChunkFilePath(app2.Settings.FileStorageDir, uploadID, 0)); err != nil ||
-		!bytes.Equal(got, sliceFor(chunkSize, data, 0)) {
+	// The bytes written before the restart are still in their final position.
+	session2, _ := app2.Repo.GetUploadSession(uploadID)
+	if session2 == nil || session2.StagedPath == "" {
+		t.Fatalf("session must keep its pre-allocated file: %+v", session2)
+	}
+	if got, err := os.ReadFile(session2.StagedPath); err != nil ||
+		!bytes.Equal(got[:chunkSize], sliceFor(chunkSize, data, 0)) {
 		t.Fatalf("chunk bytes lost across restart: %v", err)
 	}
 
@@ -128,8 +132,9 @@ func TestResumeAcrossServerRestart(t *testing.T) {
 }
 
 // TestChunkedTransferOverflowIs413NoDisk: no Content-Length header, body
-// larger than the expected chunk -> streaming guard returns 413 and no temp
-// or final chunk file is left behind.
+// larger than the expected chunk -> streaming guard returns 413, the surplus
+// byte is never written and no receipt is recorded (nothing to clean up either,
+// since there is no temp file to leak).
 func TestChunkedTransferOverflowIs413NoDisk(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -153,17 +158,21 @@ func TestChunkedTransferOverflowIs413NoDisk(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "分片体积超过限制") {
 		t.Fatalf("expected 413 body, got %s", rec.Body.String())
 	}
-	// Nothing persisted: neither final chunk nor stray temp files.
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, uploadID, 0)); !os.IsNotExist(err) {
-		t.Fatalf("oversized chunk must not persist, stat err=%v", err)
+	// Nothing is marked received and no artifact is left behind: the storage dir
+	// holds only the pre-allocated container (no temp file, no per-chunk file of
+	// the legacy layout), and the surplus byte never left the request body.
+	session, _ := app.Repo.GetUploadSession(uploadID)
+	if session == nil || session.StagedPath == "" {
+		t.Fatalf("session should own its pre-allocated file: %+v", session)
 	}
-	entries, err := os.ReadDir(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID))
-	if err == nil {
-		for _, e := range entries {
-			if strings.Contains(e.Name(), ".tmp.") || strings.HasPrefix(e.Name(), "chunk-") {
-				t.Fatalf("leftover chunk artifact: %s", e.Name())
-			}
-		}
+	if names := storageFileNames(t, app); len(names) != 1 || names[0] != filepath.Base(session.StagedPath) {
+		t.Fatalf("storage dir must hold exactly the pre-allocated file, got %v", names)
+	}
+	if info, err := os.Stat(session.StagedPath); err != nil || info.Size() != int64(chunkSize) {
+		t.Fatalf("container must keep its declared size: %v %v", info, err)
+	}
+	if entries, err := os.ReadDir(storage.LegacyUploadRoot(app.Settings.FileStorageDir)); err == nil && len(entries) > 0 {
+		t.Fatalf("legacy chunk layout must not be used anymore, found %d entries", len(entries))
 	}
 	// No DB receipt was recorded.
 	info := decode(t, getUpload(t, app, uploadID))
@@ -179,8 +188,8 @@ func TestChunkedTransferOverflowIs413NoDisk(t *testing.T) {
 	}
 }
 
-// TestContentLengthMismatch: a lying Content-Length must never pollute the
-// session (no receipts, no files) and the session must stay resumable.
+// TestContentLengthMismatch: a lying Content-Length must never be recorded as a
+// received chunk and the session must stay resumable.
 func TestContentLengthMismatch(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -202,8 +211,14 @@ func TestContentLengthMismatch(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "分片大小不匹配") {
 		t.Fatalf("expected size-mismatch 400, got %s", rec.Body.String())
 	}
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, u1, 0)); !os.IsNotExist(err) {
-		t.Fatalf("undersize chunk must be removed")
+	// The range may not be advertised as complete: a truncated body is refused
+	// without a receipt (the partial prefix is harmless -- the retry rewrites the
+	// whole range), and only the container exists on disk.
+	if names := storageFileNames(t, app); len(names) != 1 {
+		t.Fatalf("exactly one pre-allocated container expected, got %v", names)
+	}
+	if info, err := os.Stat(sessionPath(t, app, u1)); err != nil || info.Size() != int64(chunkSize) {
+		t.Fatalf("container must keep its declared size: %v %v", info, err)
 	}
 	if info := decode(t, getUpload(t, app, u1)); info["receivedCount"] != float64(0) {
 		t.Fatalf("no receipt expected, got %v", info)
@@ -216,8 +231,10 @@ func TestContentLengthMismatch(t *testing.T) {
 	requireStatus(t, putChunk(t, app, u1, 0, deterministicBytes(chunkSize)), http.StatusOK)
 	requireStatus(t, completeUpload(t, app, u1, nil), http.StatusCreated)
 
-	// Case 2: declared < actual. Overflow is still caught by the streaming
-	// limit -> 413, no file, no receipt.
+	// Case 2: declared < actual. A declared length that disagrees with the byte
+	// range is a parameter error (400) and is answered before any byte is written
+	// -- the undeclared (chunked) overflow path is covered by
+	// TestChunkedTransferOverflowIs413NoDisk, which streams without a length.
 	init2 := initUpload(t, app, "mismatch2.bin", int64(chunkSize), "application/octet-stream", "env-mm2")
 	u2 := init2["uploadId"].(string)
 	big := deterministicBytes(chunkSize + 8192)
@@ -226,9 +243,21 @@ func TestContentLengthMismatch(t *testing.T) {
 	req2.Header.Set("Content-Type", "application/octet-stream")
 	rec2 := httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec2, req2)
-	requireStatus(t, rec2, http.StatusRequestEntityTooLarge)
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, u2, 0)); !os.IsNotExist(err) {
-		t.Fatalf("overflow chunk must not persist")
+	requireStatus(t, rec2, http.StatusBadRequest)
+	if !strings.Contains(rec2.Body.String(), "分片大小不匹配") {
+		t.Fatalf("expected size-mismatch 400, got %s", rec2.Body.String())
+	}
+	if stored, _ := os.ReadFile(sessionPath(t, app, u2)); !bytes.Equal(stored, make([]byte, len(stored))) {
+		t.Fatalf("a declared-size mismatch must not write any byte")
+	}
+	// An oversize body is refused without a receipt: the range is not marked
+	// complete (a retry rewrites it in full), and no artifact of the old layout
+	// (temp file / per-chunk file) exists.
+	if names := storageFileNames(t, app); len(names) != 2 {
+		t.Fatalf("exactly two pre-allocated containers expected, got %v", names)
+	}
+	if received, _ := app.Repo.ListReceivedChunks(u2); len(received) != 0 {
+		t.Fatalf("no receipt may be recorded for an oversize body, got %v", received)
 	}
 	if info := decode(t, getUpload(t, app, u2)); info["receivedCount"] != float64(0) {
 		t.Fatalf("no receipt expected after overflow, got %v", info)
@@ -328,9 +357,10 @@ func TestConcurrentCompleteExactlyOnce(t *testing.T) {
 	if decode(t, final)["id"] != s.ClipID {
 		t.Fatalf("post-race replay must serve the stored clip")
 	}
-	// No orphan chunk dirs or temp files remain.
-	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID)); !os.IsNotExist(err) {
-		t.Fatalf("chunk dir must be gone after complete")
+	// The clip owns exactly the session's container: no extra file was created
+	// (no merge copy) and nothing was left behind.
+	if names := storageFileNames(t, app); len(names) != 1 {
+		t.Fatalf("complete must not create extra files, got %v", names)
 	}
 }
 
@@ -347,6 +377,7 @@ func TestConcurrentDeleteVsComplete(t *testing.T) {
 	for round := 0; round < 6; round++ {
 		env := fmt.Sprintf("env-rd-%d", round)
 		data := deterministicBytes(chunkSize + 777 + round)
+		baselineFiles := len(storageFileNames(t, app))
 		initUploadID := func() string {
 			rec := initClipUpload(t, app, fmt.Sprintf("rd-%d.bin", round), int64(len(data)), "application/octet-stream", env, map[string]interface{}{
 				"expiresAt": futureTimestamp(1),
@@ -395,9 +426,14 @@ func TestConcurrentDeleteVsComplete(t *testing.T) {
 			t.Fatalf("round %d: duplicate clips after race: %v", round, listed)
 		}
 
-		// Invariant 2: no orphan material for this upload id is left anywhere.
-		if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID)); !os.IsNotExist(err) {
-			t.Fatalf("round %d: chunk dir left behind", round)
+		// Invariant 2: exactly one container per round -- owned by the clip when
+		// complete won, deleted when the cancel won. No merge copy appears.
+		wanted := baselineFiles
+		if cr.Code == http.StatusCreated {
+			wanted = baselineFiles + 1
+		}
+		if names := storageFileNames(t, app); len(names) != wanted {
+			t.Fatalf("round %d: expected %d storage file(s), got %v", round, wanted, names)
 		}
 		session, _ := app.Repo.GetUploadSession(uploadID)
 		if cr.Code == http.StatusCreated {

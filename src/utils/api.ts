@@ -173,6 +173,26 @@ export type UploadChunkResponse = {
   complete: boolean;
 };
 
+// Every non-2xx answer of the chunked-upload endpoints is thrown as this shape:
+// `status` carries the HTTP code and `missing` the chunk list the server still
+// needs. Because one upload is one pre-allocated file written in place and the
+// database is the single source of truth for progress, the server can always
+// name exactly which ranges it is missing -- the client never has to guess.
+export type UploadHttpError = Error & {
+  status?: number;
+  missing?: number[];
+  // Set by the client when a chunk PUT was aborted by its own timeout (as
+  // opposed to a user cancel), so the UI can tell the two apart.
+  timeout?: boolean;
+};
+
+export const asUploadHttpError = (error: unknown): UploadHttpError => {
+  if (error instanceof Error) {
+    return error as UploadHttpError;
+  }
+  return new Error(typeof error === "string" ? error : "请求失败") as UploadHttpError;
+};
+
 // Every chunked upload becomes a file clip, so these params are part of the
 // INIT request: they are validated and persisted server-side before a single
 // chunk is stored, and /complete replays the stored copy (it never accepts
@@ -270,8 +290,12 @@ export const initFileUpload = async (
   if (params.maxDownloads != null) body.maxDownloads = params.maxDownloads;
   if (params.accessCode) body.accessCode = params.accessCode;
   if (params.accessToken) body.accessToken = params.accessToken;
-  return request<UploadInitResponse>(`${API_BASE}/uploads/init`, {
+  // requestRaw (not request): upload failures must carry `status` so the
+  // client can tell a retryable 409 ("session still held by a completing row")
+  // from a permanent parameter error.
+  return requestRaw<UploadInitResponse>(`${API_BASE}/uploads/init`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
 };
@@ -279,17 +303,35 @@ export const initFileUpload = async (
 export const getUploadInfo = async (
   uploadId: string
 ): Promise<UploadInfoResponse> => {
-  return request<UploadInfoResponse>(
+  // The resume probe needs `status` too: 404/410 mean the session is gone,
+  // while 409/others are only informative for the caller.
+  return requestRaw<UploadInfoResponse>(
     `${API_BASE}/uploads/${encodeURIComponent(uploadId)}`
   );
 };
 
+// uploadChunkBytes PUTs the raw bytes of one chunk into its byte range of the
+// pre-allocated file (offset = index * chunkSize).
+//
+// The server enforces a strict size contract: every chunk but the last one must
+// carry exactly `chunkSize` bytes, the last one the remainder. Sending anything
+// else is a parameter error the server answers with 400/413, so the client
+// refuses locally first (same rule, same wording) and never burns a round trip
+// on a payload the server has to reject.
 export const uploadChunkBytes = async (
   uploadId: string,
   index: number,
   blob: Blob,
-  opts?: { signal?: AbortSignal }
+  opts?: { signal?: AbortSignal; expectedBytes?: number }
 ): Promise<UploadChunkResponse> => {
+  const expected = opts?.expectedBytes;
+  if (expected !== undefined && blob.size !== expected) {
+    const error = new Error(
+      `分片大小不匹配：第 ${index} 块应为 ${expected} 字节，实际 ${blob.size} 字节`
+    ) as UploadHttpError;
+    error.status = 400;
+    throw error;
+  }
   return requestRaw<UploadChunkResponse>(
     `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`,
     {
@@ -319,7 +361,9 @@ export const completeUpload = async (
 };
 
 export const abortFileUpload = async (uploadId: string): Promise<void> => {
-  await request(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}`, {
+  // A completed or completing session cannot be aborted (409): that is not an
+  // error for the caller, which only uses abort as best-effort cleanup.
+  await requestRaw<{ ok: boolean }>(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}`, {
     method: "DELETE"
   });
 };

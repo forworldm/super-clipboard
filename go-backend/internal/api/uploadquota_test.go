@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -106,12 +107,9 @@ func TestInitQuotaBoundaryAndRefusal(t *testing.T) {
 	if got := activeSessions(t, app); got != sessionsBefore {
 		t.Fatalf("a refused init created a session (%d -> %d)", sessionsBefore, got)
 	}
-	dirs, err := storage.ListUploadDirsOnDisk(app.Settings.FileStorageDir)
-	if err != nil {
-		t.Fatalf("list upload dirs: %v", err)
-	}
-	if len(dirs) != 2 {
-		t.Fatalf("a refused init must not create a chunk dir, found %v", dirs)
+	// Exactly the two accepted inits own a storage file; the refused one owns none.
+	if got := storageFileCount(t, app); got != 2 {
+		t.Fatalf("a refused init must not allocate a file, found %d (expected 2)", got)
 	}
 
 	// Freeing the 600 byte session re-opens exactly that much budget.
@@ -216,12 +214,8 @@ func TestInitDiskWatermark507(t *testing.T) {
 	if got := activeSessions(t, app); got != 0 {
 		t.Fatalf("a refused init created %d session(s)", got)
 	}
-	dirs, err := storage.ListUploadDirsOnDisk(app.Settings.FileStorageDir)
-	if err != nil {
-		t.Fatalf("list upload dirs: %v", err)
-	}
-	if len(dirs) != 0 {
-		t.Fatalf("a refused init created dirs %v", dirs)
+	if got := storageFileCount(t, app); got != 0 {
+		t.Fatalf("a refused init must not allocate a file, found %d", got)
 	}
 
 	// Exactly at the watermark is fine, and an unreadable probe fails open.
@@ -247,8 +241,18 @@ func TestChunkWriteBlockedByDiskWatermark(t *testing.T) {
 	rec := putChunk(t, app, uploadID, 0, data)
 	requireStatus(t, rec, http.StatusInsufficientStorage)
 	requireDetail(t, rec, "磁盘可用空间不足")
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, uploadID, 0)); err == nil {
-		t.Fatal("chunk file must not be written below the watermark")
+	// The pre-allocated file exists (init created it) but must still be all zeros:
+	// not a single payload byte may be written below the watermark.
+	session, _ := app.Repo.GetUploadSession(uploadID)
+	if session == nil || session.StagedPath == "" {
+		t.Fatalf("session should own its pre-allocated file: %+v", session)
+	}
+	stored, err := os.ReadFile(session.StagedPath)
+	if err != nil {
+		t.Fatalf("read pre-allocated file: %v", err)
+	}
+	if !bytes.Equal(stored, make([]byte, len(data))) {
+		t.Fatalf("payload landed on disk below the watermark (%d bytes)", len(stored))
 	}
 	received, err := app.Repo.ListReceivedChunks(uploadID)
 	if err != nil {
@@ -261,6 +265,17 @@ func TestChunkWriteBlockedByDiskWatermark(t *testing.T) {
 	// Watermark recovered: the very same chunk is accepted.
 	app.freeBytesFn = func(string) (int64, error) { return 1 << 30, nil }
 	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
+}
+
+// storageFileCount counts the upload containers a test app currently owns
+// (a refused init must leave the storage dir untouched).
+func storageFileCount(t *testing.T, app *App) int {
+	t.Helper()
+	names, err := storage.ListStorageFiles(app.Settings.FileStorageDir)
+	if err != nil {
+		t.Fatalf("list storage files: %v", err)
+	}
+	return len(names)
 }
 
 // TestInitReplayDoesNotReserveTwice keeps idempotent init from eating budget.

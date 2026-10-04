@@ -920,6 +920,18 @@
   animation: upload-progress-pulse 0.9s ease-in-out infinite;
 }
 
+/* The server dropped its receipts: the same session restarts from the ranges it
+   still needs (no merge step involved). */
+.upload-progress__fill--restarting {
+  background: var(--orange, #ff9f0a);
+  animation: upload-progress-pulse 0.9s ease-in-out infinite;
+}
+
+/* Every range is written; COMPLETE only inserts the clip row. */
+.upload-progress__fill--finalizing {
+  animation: upload-progress-pulse 0.9s ease-in-out infinite;
+}
+
 @keyframes upload-progress-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.45; }

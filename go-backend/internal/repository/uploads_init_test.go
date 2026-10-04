@@ -277,8 +277,7 @@ func TestCreateOrGetUploadSessionNonRetryableErrorsReturnImmediately(t *testing.
 	if err := repo.MarkChunkReceived(created.ID, 0, 100); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := repo.TryBeginComplete(created.ID,
-		filepath.Join(repo.Settings().FileStorageDir, "merge.bin")); err != nil {
+	if _, _, err := repo.TryBeginComplete(created.ID); err != nil {
 		t.Fatalf("begin complete: %v", err)
 	}
 	if err := repo.SetUploadExpiryForTest(created.ID, time.Now().Add(-time.Minute).Unix()); err != nil {

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,10 +25,23 @@ import (
 //
 // Protocol guarantees:
 //   - uploadId / chunkSize / totalChunks are server-generated (init).
-//   - chunks are raw bytes (no base64, no giant JSON), idempotent rewrites.
-//   - sessions persist in SQLite; chunk bytes persist on disk for resume
-//     across network drops and server restarts.
-//   - no global lock is held during file IO (see repository docs).
+//   - ONE file per upload, pre-allocated by INIT at its FINAL path with
+//     truncate(fileSize) (sparse: no bytes are consumed until written). Because
+//     fileSize and chunkSize are known at init, every chunk's [start, end) byte
+//     range is known too, so PUT writes its bytes directly into that range with
+//     WriteAt and COMPLETE has nothing to merge -- no temp copy, no double disk
+//     usage, no blocking assembly step.
+//   - A chunk is "received" exactly when its receipt row is committed in
+//     upload_chunks; the database is the only source of truth for progress. The
+//     receipt is written AFTER the bytes were written and fsynced, so a crash can
+//     only under-report progress (the client re-sends that range), never
+//     over-report it.
+//   - Every chunk but the last one must carry exactly chunkSize bytes (the last
+//     one carries the remainder); any other payload size is refused with a
+//     parameter error before/while writing, so a range can never be half-filled
+//     and then marked complete.
+//   - No global lock is held during file IO (see repository docs), and chunk
+//     ranges are disjoint, so parallel PUTs of one upload are safe.
 // ---------------------------------------------------------------------------
 
 func uploadIDFromRequest(r *http.Request) string {
@@ -40,7 +52,7 @@ func uploadIDFromRequest(r *http.Request) string {
 	return routeParam(r, "upload_id")
 }
 
-// expireUploadNow deletes an expired session (DB under short lock, files outside)
+// expireUploadNow deletes an expired session (DB under short lock, file outside)
 // and reports whether a row was actually removed.
 func (a *App) expireUploadNow(session *repository.UploadSession) {
 	if session == nil {
@@ -51,21 +63,13 @@ func (a *App) expireUploadNow(session *repository.UploadSession) {
 		// Already gone or completed-with-clip: nothing to do.
 		return
 	}
-	_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, session.ID)
+	// An aborted session never owns a clip, so its pre-allocated file is orphan.
 	if aborted.StagedPath != "" && aborted.ClipID == "" {
-		_ = os.Remove(aborted.StagedPath)
-		_ = os.Remove(aborted.StagedPath + ".part")
-	}
-	// Best-effort: remove any leftover .part.* temps for this staged file.
-	if aborted.StagedPath != "" {
-		matches, _ := filepath.Glob(aborted.StagedPath + ".part.*")
-		for _, m := range matches {
-			_ = os.Remove(m)
-		}
+		_ = storage.RemoveUploadFile(aborted.StagedPath)
 	}
 }
 
-// loadActiveUpload loads session+chunks, handling 404/410 mapping.
+// loadActiveUpload loads the session, handling 404/410 mapping.
 // When expired it synchronously purges (rollback) and returns ok=false with
 // expired=true so handlers can emit 410.
 func (a *App) loadActiveUpload(w http.ResponseWriter, uploadID string) (session *repository.UploadSession, received []int, ok bool, expired bool) {
@@ -91,74 +95,29 @@ func (a *App) loadActiveUpload(w http.ResponseWriter, uploadID string) (session 
 	return s, r, true, false
 }
 
-// reconcileDiskState makes DB receipts match files actually on disk (outside the
-// global lock for IO, brief locks for DB fixes). It returns the corrected
-// received list. Used by GET (resume accuracy) and startup recovery.
-func (a *App) reconcileDiskState(session *repository.UploadSession, received []int) []int {
-	if session == nil || session.Status == repository.UploadStatusCompleted {
-		return received
+// ensureUploadStorage guarantees the session's byte container exists with the
+// exact declared length. It reports recreated=true when the file had to be
+// created/resized, which invalidates every receipt: the caller must drop them
+// because the byte ranges they describe are gone (the DB is the single source of
+// truth, so a stale receipt would be read as "this range is on disk").
+func (a *App) ensureUploadStorage(session *repository.UploadSession) (recreated bool, err error) {
+	if session == nil || session.StagedPath == "" {
+		return false, errors.New("upload session has no storage path")
 	}
-	onDisk, err := storage.ListChunkFilesOnDisk(a.Settings.FileStorageDir, session.ID)
-	if err != nil {
-		a.logger.Printf("ERROR:    unable to scan upload dir %s: %v", session.ID, err)
-		return received
+	return storage.EnsureFileSize(session.StagedPath, session.FileSize)
+}
+
+// allChunkIndices returns [0, totalChunks) as a list (used when the whole upload
+// has to be re-sent).
+func allChunkIndices(total int) []int {
+	if total <= 0 {
+		return []int{}
 	}
-	want := make(map[int]bool, session.TotalChunks)
-	for i := 0; i < session.TotalChunks; i++ {
-		want[i] = true
+	out := make([]int, 0, total)
+	for i := 0; i < total; i++ {
+		out = append(out, i)
 	}
-	haveDB := make(map[int]bool, len(received))
-	for _, idx := range received {
-		haveDB[idx] = true
-	}
-	var toDelete []int
-	for idx := range haveDB {
-		if !want[idx] {
-			toDelete = append(toDelete, idx) // stale index (should not happen)
-			continue
-		}
-		if _, ok := onDisk[idx]; !ok {
-			toDelete = append(toDelete, idx) // DB says yes, disk says no
-		}
-	}
-	restore := make(map[int]int64)
-	for idx, size := range onDisk {
-		if !want[idx] {
-			continue
-		}
-		if !haveDB[idx] {
-			// Crash between file rename and DB commit: file is durable, restore receipt.
-			restore[idx] = size
-		}
-	}
-	if len(toDelete) > 0 {
-		if err := a.Repo.DeleteChunkRecords(session.ID, toDelete); err != nil {
-			a.logger.Printf("ERROR:    unable to prune missing chunks for %s: %v", session.ID, err)
-		} else {
-			pruned := make(map[int]bool, len(toDelete))
-			for _, idx := range toDelete {
-				pruned[idx] = true
-			}
-			kept := received[:0]
-			for _, idx := range received {
-				if !pruned[idx] {
-					kept = append(kept, idx)
-				}
-			}
-			received = kept
-		}
-	}
-	if len(restore) > 0 {
-		if err := a.Repo.RestoreChunkRecords(session.ID, restore); err != nil {
-			a.logger.Printf("ERROR:    unable to restore chunk receipts for %s: %v", session.ID, err)
-		} else {
-			for idx := range restore {
-				received = append(received, idx)
-			}
-			sort.Ints(received)
-		}
-	}
-	return received
+	return out
 }
 
 func toMillis(unixSec int64) int64 { return unixSec * 1000 }
@@ -230,6 +189,10 @@ func (a *App) checkDiskWatermark(w http.ResponseWriter) bool {
 // session/disk is created (unverified clients can never consume storage),
 // then the global storage gates (session cap, quota reservation, disk
 // watermark), then a race-safe insert keyed on (environment, requestId).
+//
+// The byte container is created here, at its final path: truncate(fileSize)
+// fixes the total length while the file is already in place, so later PUTs write
+// in-range and COMPLETE only has to insert the clip row.
 func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
@@ -252,7 +215,7 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Idempotent replay: an existing live session for (env, requestId) is
 	// returned as-is (200 + its receivedChunks). Highly desired: network retry
-	// of init never leaks a second session dir onto disk.
+	// of init never allocates a second file or leaks a session row.
 	if req.RequestID != "" {
 		existing, err := a.Repo.GetUploadSessionByRequestID(req.EnvironmentID, req.RequestID)
 		if err != nil {
@@ -273,8 +236,8 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
-			// Expired key: purge rows AND chunk files so a fresh session can
-			// reuse the idempotency slot without orphaning old bytes.
+			// Expired key: purge row AND file so a fresh session can reuse the
+			// idempotency slot without orphaning old bytes.
 			a.expireUploadNow(existing)
 		}
 	}
@@ -288,7 +251,7 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Captcha gate: verified once, up-front, before any chunk can be stored.
+	// Captcha gate: verified once, up-front, before a single byte can be stored.
 	// Turnstile tokens are single-use & short-lived, so they belong at init.
 	if !a.verifyCaptcha(w, r, req.CaptchaToken, req.CaptchaProvider) {
 		return
@@ -319,7 +282,7 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	// ---- Global storage gates. Fixed order: live-session cap, then quota
 	// reservation (atomic CAS in the DB), then the free-disk watermark. All of
 	// them run before the session row exists, so a refusal leaves nothing
-	// behind: no session, no bytes on disk, no dangling reservation.
+	// behind: no session, no file, no dangling reservation.
 	quotaLimit := a.Settings.EffectiveUploadQuota()
 	sessionLimit := a.Settings.EffectiveMaxActiveUploadSessions()
 	if sessionLimit > 0 {
@@ -359,6 +322,9 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 
 	chunkSize := a.Settings.EffectiveChunkSize()
 	ttl := a.Settings.EffectiveUploadTTL()
+	// The byte container path is decided BEFORE the insert: it is the final clip
+	// path, so the row and the file are born together and never need a rename.
+	_, finalPath := storage.FinalStoragePath(a.Settings.FileStorageDir, req.Filename, req.MimeType)
 	session, created, err := a.Repo.CreateOrGetUploadSession(repository.CreateUploadSessionParams{
 		Filename: req.Filename, FileSize: req.FileSize, MimeType: req.MimeType,
 		EnvironmentID: req.EnvironmentID, RequestID: req.RequestID,
@@ -366,11 +332,12 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		ClipExpiresAt:    req.ExpiresAt,
 		ClipMaxDownloads: req.MaxDownloads, ClipAccessCode: req.AccessCode,
 		ClipAccessToken: req.AccessToken,
+		StagedPath:      finalPath,
 	})
 	if err != nil {
 		releaseReservation()
 		// The idempotency key is still held by a session we cannot purge yet
-		// (expired mid-merge): surface a retryable conflict instead of a 200
+		// (expired mid-complete): surface a retryable conflict instead of a 200
 		// carrying an uploadId that can only fail.
 		var unavailable *repository.SessionUnavailableError
 		if errors.As(err, &unavailable) {
@@ -384,13 +351,13 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		// The session row owns the reservation from here on; abort, expiry
 		// cleanup and complete success all return it through the idempotent
 		// quota_released CAS. A failed complete rolls back to `active` and keeps
-		// both its chunks and its reservation (terminal transitions only).
+		// both its bytes and its reservation (terminal transitions only).
 		reservationHeld = false
 	}
 	if !created {
 		// Lost the insert race or an exact-replica row appeared in between: the
-		// winning session already holds a reservation, so give ours back (a
-		// replayed init must never reserve twice).
+		// winning session already holds a reservation and owns its file, so give
+		// ours back (a replayed init must never reserve twice) and never allocate.
 		releaseReservation()
 		received, listErr := a.Repo.ListReceivedChunks(session.ID)
 		if listErr != nil || received == nil {
@@ -404,11 +371,13 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Directory creation is IO outside the repository lock. On failure roll
-	// back the DB row so no orphan session remains.
-	if err := storage.EnsureUploadDir(a.Settings.FileStorageDir, session.ID); err != nil {
+	// File creation is IO outside the repository lock. On failure roll back the
+	// DB row (which also returns the reservation) so no orphan session remains.
+	if err := storage.PreallocateFile(finalPath, session.FileSize); err != nil {
 		_, _ = a.Repo.AbortUploadSession(session.ID)
-		writeError(w, err)
+		_ = storage.RemoveUploadFile(finalPath)
+		a.logger.Printf("ERROR:    unable to pre-allocate upload file %s: %v", finalPath, err)
+		writeError(w, newHTTPError(http.StatusInternalServerError, "无法创建上传文件，请重试"))
 		return
 	}
 	writeJSON(w, http.StatusCreated, schemas.UploadInitResponse{
@@ -420,6 +389,12 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // PUT /api/uploads/{id}/chunks/{index} -- raw chunk bytes.
+//
+// The payload is written straight into its byte range of the pre-allocated file
+// (offset = index * chunkSize, length = expected chunk size). Sizes are enforced
+// twice: a Content-Length that disagrees with the range is refused before any
+// IO, and a body that delivers a different length is refused while streaming.
+// Only a fully written, fsynced range is recorded in the database.
 func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 	uploadID := uploadIDFromRequest(r)
 	indexRaw := routeParam(r, "index")
@@ -428,7 +403,7 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, newHTTPError(http.StatusBadRequest, "分片序号无效"))
 		return
 	}
-	session, received, ok, _ := a.loadActiveUpload(w, uploadID)
+	session, _, ok, _ := a.loadActiveUpload(w, uploadID)
 	if !ok {
 		return
 	}
@@ -437,7 +412,7 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session.Status == repository.UploadStatusCompleting {
-		writeError(w, newHTTPError(http.StatusConflict, "上传正在合并，请稍后重试"))
+		writeError(w, newHTTPError(http.StatusConflict, "上传正在完成，请稍后重试"))
 		return
 	}
 	if session.TotalChunks == 0 {
@@ -448,10 +423,24 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, newHTTPError(http.StatusBadRequest, "分片序号超出范围"))
 		return
 	}
+	if session.StagedPath == "" {
+		// Only rows written by an older (pre-allocated) version: they have no
+		// container, so they cannot be resumed -- ask for a fresh upload.
+		writeError(w, newHTTPError(http.StatusBadRequest, "上传会话缺少文件路径，请重新上传"))
+		return
+	}
 	expected, _ := session.ExpectedChunkSize(index)
-	// Fast-path 413 when Content-Length already exceeds expectation.
+	offset, _ := session.ChunkOffset(index)
+	// Size contract: every chunk but the last one is exactly chunkSize bytes,
+	// the last one is the remainder. A declared length that disagrees is a
+	// parameter error -> refuse before touching the file.
 	if r.ContentLength > expected {
 		writeError(w, newHTTPError(http.StatusRequestEntityTooLarge, "分片体积超过限制"))
+		return
+	}
+	if r.ContentLength >= 0 && r.ContentLength != expected {
+		writeError(w, newHTTPError(http.StatusBadRequest,
+			fmt.Sprintf("分片大小不匹配：第 %d 块应为 %d 字节，实际声明 %d 字节", index, expected, r.ContentLength)))
 		return
 	}
 	if r.Body == nil {
@@ -463,65 +452,95 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 	if !a.checkDiskWatermark(w) {
 		return
 	}
-	// Stream to disk (no global lock). Limit to expected size; overflow is 413.
-	// Client cancellation surfaces as a read error -> 499-style abort without
-	// touching DB, leaving the session resumable.
+	// Self-heal a lost/resized container: recreate the file and drop receipts,
+	// because the ranges they describe no longer exist.
+	recreated, err := a.ensureUploadStorage(session)
+	if err != nil {
+		a.logger.Printf("ERROR:    unable to prepare upload file %s: %v", session.StagedPath, err)
+		writeError(w, newHTTPError(http.StatusInternalServerError, "分片存储失败，请重试"))
+		return
+	}
+	if recreated {
+		if fresh, _ := a.Repo.GetUploadSession(session.ID); fresh == nil {
+			_ = storage.RemoveUploadFile(session.StagedPath)
+			writeError(w, newHTTPError(http.StatusNotFound, "上传会话不存在"))
+			return
+		}
+		if err := a.Repo.ClearChunkReceipts(session.ID); err != nil {
+			a.logger.Printf("ERROR:    unable to reset chunk receipts for %s: %v", session.ID, err)
+			writeError(w, err)
+			return
+		}
+		a.logger.Printf("WARN:    upload file %s was missing/unsized; re-created and all receipts cleared", session.StagedPath)
+	}
+	// Stream into the byte range (no global lock, ranges are disjoint). Client
+	// cancellation surfaces as a read error: the range stays unrecorded, so the
+	// session remains resumable.
 	defer r.Body.Close()
-	stored, err := storage.WriteChunkStream(a.Settings.FileStorageDir, session.ID, index, r.Body, expected)
+	written, err := storage.WriteChunkRange(session.StagedPath, offset, expected, r.Body)
 	if err != nil {
 		if errors.Is(err, storage.ErrChunkTooLarge) {
 			writeError(w, newHTTPError(http.StatusRequestEntityTooLarge, "分片体积超过限制"))
 			return
 		}
-		// Distinguish client disconnect (context cancelled) from server IO errors.
 		if r.Context().Err() != nil {
-			// Client went away; nothing to render (connection dead). Just ensure
-			// no partial chunk lingers (WriteChunkStream already cleaned temp).
+			// Client went away; nothing to render (connection dead).
 			return
 		}
 		a.logger.Printf("ERROR:    unable to store chunk %s/%d: %v", session.ID, index, err)
 		writeError(w, newHTTPError(http.StatusInternalServerError, "分片存储失败，请重试"))
 		return
 	}
-	if stored != expected {
-		// Undersize (truncated body / wrong slice): drop the bad file, keep resumable.
-		_ = os.Remove(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, index))
-		writeError(w, newHTTPError(http.StatusBadRequest, "分片大小不匹配，请重试"))
+	if written != expected {
+		// Truncated body: the range is incomplete, so it must NOT be recorded.
+		// Any older receipt for this index is dropped as well, because this
+		// attempt may have overwritten part of a previously good range.
+		if err := a.Repo.DeleteChunkReceipt(session.ID, index); err != nil {
+			a.logger.Printf("ERROR:    unable to drop partial receipt %s/%d: %v", session.ID, index, err)
+		}
+		writeError(w, newHTTPError(http.StatusBadRequest,
+			fmt.Sprintf("分片大小不匹配：第 %d 块应为 %d 字节，实际收到 %d 字节，请重传该分片", index, expected, written)))
 		return
 	}
-	// Durable file -> brief DB upsert (idempotent rewrite for retries).
-	if err := a.Repo.MarkChunkReceived(session.ID, index, stored); err != nil {
+	// The range is complete: make it durable, then publish the receipt.
+	if err := storage.FlushFile(session.StagedPath); err != nil {
+		a.logger.Printf("ERROR:    unable to flush upload file %s: %v", session.StagedPath, err)
+		writeError(w, newHTTPError(http.StatusInternalServerError, "分片存储失败，请重试"))
+		return
+	}
+	if err := a.Repo.MarkChunkReceived(session.ID, index, written); err != nil {
+		// The chunk cannot be recorded honestly: undo the range and let the
+		// client retry instead of reporting a success the DB does not know.
+		if err := a.Repo.DeleteChunkReceipt(session.ID, index); err != nil {
+			a.logger.Printf("ERROR:    unable to drop unrecorded receipt %s/%d: %v", session.ID, index, err)
+		}
 		if errors.Is(err, sql.ErrNoRows) {
-			_ = os.Remove(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, index))
+			if recreated {
+				// The container was created by this request and nothing owns it.
+				_ = storage.RemoveUploadFile(session.StagedPath)
+			}
 			writeError(w, newHTTPError(http.StatusNotFound, "上传会话不存在"))
 			return
 		}
-		// Session completed concurrently: chunk file is now orphan; best-effort remove.
 		if errors.Is(err, repository.ErrUploadAlreadyCompleted) {
-			_ = os.Remove(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, index))
 			writeError(w, newHTTPError(http.StatusConflict, "上传已完成"))
 			return
 		}
+		var mismatch *repository.ChunkSizeMismatchError
+		if errors.As(err, &mismatch) {
+			writeError(w, newHTTPError(http.StatusBadRequest, "分片大小不匹配，请重传该分片"))
+			return
+		}
 		a.logger.Printf("ERROR:    unable to record chunk %s/%d: %v", session.ID, index, err)
-		_ = os.Remove(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, index))
 		writeError(w, err)
 		return
 	}
-	// Re-list for an accurate progress response (cheap indexed read).
+	// Re-read for an accurate progress response (cheap indexed read).
 	updated, err := a.Repo.ListReceivedChunks(session.ID)
 	if err != nil {
-		updated = append(append([]int{}, received...), index)
-		sort.Ints(updated)
-		// Deduplicate in case of rewrite.
-		dedup := updated[:0]
-		var prev = -1
-		for _, v := range updated {
-			if v != prev {
-				dedup = append(dedup, v)
-				prev = v
-			}
-		}
-		updated = dedup
+		a.logger.Printf("ERROR:    unable to list received chunks for %s: %v", session.ID, err)
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, schemas.UploadChunkResponse{
 		UploadID: session.ID, Index: index, ReceivedCount: len(updated),
@@ -530,25 +549,14 @@ func (a *App) handlePutChunk(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/uploads/{id} -- resume info.
+// GET /api/uploads/{id} -- resume info. The response is computed from the
+// database alone: upload_chunks is the single source of truth for progress.
 func (a *App) handleGetUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := uploadIDFromRequest(r)
 	session, received, ok, _ := a.loadActiveUpload(w, uploadID)
 	if !ok {
 		return
 	}
-	// Completed sessions: report stored state (no disk scan needed).
-	if session.Status == repository.UploadStatusCompleted {
-		writeJSON(w, http.StatusOK, schemas.UploadInfoResponse{
-			UploadID: session.ID, Filename: session.Filename, FileSize: session.FileSize,
-			MimeType: session.MimeType, ChunkSize: session.ChunkSize, TotalChunks: session.TotalChunks,
-			ReceivedChunks: received, ReceivedCount: len(received), MissingChunks: []int{},
-			Status: session.Status, CreatedAt: toMillis(session.CreatedAt),
-			UpdatedAt: toMillis(session.UpdatedAt), ExpiresAt: toMillis(session.ExpiresAt),
-		})
-		return
-	}
-	received = a.reconcileDiskState(session, received)
 	missing := repository.MissingChunks(session.TotalChunks, received)
 	if missing == nil {
 		missing = []int{}
@@ -580,7 +588,7 @@ func (a *App) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		var completing *repository.SessionCompletingError
 		if errors.As(err, &completing) {
-			writeError(w, newHTTPError(http.StatusConflict, "上传正在合并，无法取消"))
+			writeError(w, newHTTPError(http.StatusConflict, "上传正在完成，无法取消"))
 			return
 		}
 		var completed *repository.SessionCompletedError
@@ -591,22 +599,23 @@ func (a *App) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// Files outside the lock. A completed session (which always owns a clip) is
-	// rejected above, so a staged path here belongs to an aborted upload and is
-	// always safe to delete.
-	_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, uploadID)
+	// File deletion happens outside the lock. A completed session (which always
+	// owns a clip) is rejected above, so the pre-allocated file belongs to an
+	// aborted upload and is always safe to delete.
 	if session.StagedPath != "" && session.ClipID == "" {
-		_ = os.Remove(session.StagedPath)
-		matches, _ := filepath.Glob(session.StagedPath + ".part.*")
-		for _, m := range matches {
-			_ = os.Remove(m)
-		}
+		_ = storage.RemoveUploadFile(session.StagedPath)
 	}
 	writeJSON(w, http.StatusOK, schemas.DeleteResponse{OK: true})
 }
 
-// POST /api/uploads/{id}/complete -- assemble the chunk stream and insert the
-// file clip.
+// POST /api/uploads/{id}/complete -- turn a finished upload into a clip.
+//
+// There is NO assembly step anymore: INIT already created the final file at its
+// final path and every PUT wrote its bytes in place, so COMPLETE only verifies
+// the receipts, flips the state machine (active->completing->completed) and
+// inserts the clip row pointing at the file. That keeps a large upload from
+// blocking the API for the duration of a merge and removes the second full copy
+// of the data from disk.
 //
 // The clip parameters are NOT accepted here: they were validated at init and
 // frozen on the session row, so a client cannot bypass validation by sending
@@ -647,88 +656,82 @@ func (a *App) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session.Status == repository.UploadStatusCompleting {
-		writeError(w, newHTTPError(http.StatusConflict, "上传正在合并，请稍后查询"))
+		writeError(w, newHTTPError(http.StatusConflict, "上传正在完成，请稍后查询"))
+		return
+	}
+	if session.StagedPath == "" {
+		writeError(w, newHTTPError(http.StatusBadRequest, "上传会话缺少文件路径，请重新上传"))
 		return
 	}
 
-	// Pre-validation of the session-frozen clip params BEFORE touching upload
-	// state or doing assembly IO: environment + expiry + token ownership (short
-	// DB reads). Failures here leave the chunks intact and resumable. Captcha
-	// and the clip field format were already verified at init.
+	// Pre-validation of the session-frozen clip params BEFORE any state change:
+	// environment + token ownership (short DB reads). Failures here leave the
+	// receipts intact and resumable. Captcha and the clip field format were
+	// already verified at init.
 	if proceed := a.preValidateCompleteClip(w, r, session); !proceed {
 		return
 	}
 
-	// Reserve the final path and flip active->completing atomically (short lock).
-	// stagedPath is recorded for crash recovery: a power loss mid-assembly
-	// leaves `completing` + stagedPath behind, which startup resets.
-	_, finalPath := storage.FinalStoragePath(a.Settings.FileStorageDir, session.Filename, session.MimeType)
-	completing, _, err := a.Repo.TryBeginComplete(uploadID, finalPath)
+	// Pre-flight the byte container. If it vanished (or was resized out of band)
+	// every receipt became a lie: re-create the file, drop the receipts and tell
+	// the client to re-send the whole upload.
+	recreated, err := a.ensureUploadStorage(session)
+	if err != nil {
+		a.logger.Printf("ERROR:    unable to verify upload file %s: %v", session.StagedPath, err)
+		writeError(w, newHTTPError(http.StatusInternalServerError, "文件校验失败，请重试"))
+		return
+	}
+	if recreated {
+		// DELETE/expiry remove the row BEFORE the file, so a missing file with a
+		// live row means real disk loss; a missing row means the session is gone.
+		if fresh, _ := a.Repo.GetUploadSession(uploadID); fresh == nil {
+			_ = storage.RemoveUploadFile(session.StagedPath)
+			writeError(w, newHTTPError(http.StatusNotFound, "上传会话不存在"))
+			return
+		}
+		if err := a.Repo.ClearChunkReceipts(session.ID); err != nil {
+			a.logger.Printf("ERROR:    unable to reset chunk receipts for %s: %v", session.ID, err)
+			writeError(w, err)
+			return
+		}
+		a.logger.Printf("WARN:    upload file %s was missing/unsized; all receipts cleared for %s", session.StagedPath, session.ID)
+		writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"detail":  "上传文件已丢失，请重新上传全部分片",
+			"missing": allChunkIndices(session.TotalChunks),
+		})
+		return
+	}
+
+	// Flip active->completing (short lock, pure concurrency guard: there is no
+	// long IO to protect anymore) and verify every chunk has a receipt.
+	completing, _, err := a.Repo.TryBeginComplete(uploadID)
 	if err != nil {
 		a.writeCompleteTransitionError(w, err)
 		return
 	}
 
-	// Assembly IO with NO locks held. Any failure rolls the session back to
-	// active (FailComplete) and deletes the partial staged file, preserving
-	// chunks for resume/retry.
-	if err := a.assembleSessionFiles(session, completing); err != nil {
-		var missing *repository.MissingChunksError
-		if errors.As(err, &missing) {
-			// Chunks vanished from disk (manual deletion / disk loss): prune DB
-			// receipts so the next GET accurately reports them as missing.
-			_ = a.Repo.DeleteChunkRecords(uploadID, missing.Missing)
-		}
-		if staged, _ := a.Repo.FailComplete(uploadID); staged != "" {
-			_ = os.Remove(staged)
-			matches, _ := filepath.Glob(staged + ".part.*")
-			for _, m := range matches {
-				_ = os.Remove(m)
-			}
-		} else {
-			_ = os.Remove(finalPath)
-		}
-		// Surface missing-chunk details for resume.
-		var missingErr *repository.MissingChunksError
-		if errors.As(err, &missingErr) {
-			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-				"detail":  "分片缺失，请续传后重试",
-				"missing": missingErr.Missing,
-			})
-			return
-		}
-		a.logger.Printf("ERROR:    unable to assemble upload %s: %v", uploadID, err)
-		writeError(w, newHTTPError(http.StatusInternalServerError, "文件合并失败，请重试"))
-		return
-	}
-
-	// Assembly succeeded. The ONLY way to finish an upload is to insert the clip
-	// from the params frozen at init. Concurrent completes can still collide
-	// (an accessCode claimed since init, a token owner changed, the expiry that
-	// passed while uploading): such a failure must not leave a half-finished
-	// upload behind, so the session is rolled back to active -- staged file
-	// deleted, chunk receipts kept so the client can resume or abort -- and the
-	// typed error (409 conflict / 400 value error) is surfaced.
+	// The ONLY way to finish an upload is to insert the clip from the params
+	// frozen at init. Concurrent completes can still collide (an accessCode
+	// claimed since init, a token owner changed, the expiry that passed while
+	// uploading): such a failure rolls the session back to active -- receipts and
+	// bytes untouched, so the client can retry or abort -- and the typed error
+	// (409 conflict / 400 value error) is surfaced.
 	clip, err := a.createClipFromCompletedUpload(session, completing)
 	if err != nil {
-		// Rollback: the staged file is orphan (no clip owns it) -> delete.
-		_ = os.Remove(completing.StagedPath)
-		if staged, _ := a.Repo.FailComplete(uploadID); staged != "" && staged != completing.StagedPath {
-			_ = os.Remove(staged)
+		if _, failErr := a.Repo.FailComplete(uploadID); failErr != nil {
+			a.logger.Printf("ERROR:    unable to roll back complete for %s: %v", uploadID, failErr)
 		}
 		a.writeClipCreationError(w, err)
 		return
 	}
 	completed, err := a.Repo.CompleteUploadSession(uploadID, clip.ID)
 	if err != nil {
-		// Extremely rare: session was aborted/expired between assembly and
-		// commit. The clip already exists (do NOT delete user data); just
-		// surface success via the clip (session row is gone, cannot record).
+		// The clip already exists (do NOT delete user data); just surface success
+		// via the clip (the session row is gone, so the link cannot be recorded).
 		a.logger.Printf("ERROR:    complete commit raced abort for %s (clip %s kept): %v", uploadID, clip.ID, err)
 		writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 		return
 	}
-	_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, uploadID)
 	_ = completed
 	writeJSON(w, http.StatusCreated, schemas.ClipFromModel(clip, utils.BuildBaseURL(r)))
 }
@@ -778,7 +781,7 @@ func (a *App) writeCompleteTransitionError(w http.ResponseWriter, err error) {
 	}
 	var completing *repository.SessionCompletingError
 	if errors.As(err, &completing) {
-		writeError(w, newHTTPError(http.StatusConflict, "上传正在合并，请稍后查询"))
+		writeError(w, newHTTPError(http.StatusConflict, "上传正在完成，请稍后查询"))
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -788,61 +791,9 @@ func (a *App) writeCompleteTransitionError(w http.ResponseWriter, err error) {
 	writeError(w, err)
 }
 
-// assembleSessionFiles streams chunks into the staged path and verifies size.
-// No locks held. Returns MissingChunksError when a chunk file is absent.
-func (a *App) assembleSessionFiles(session *repository.UploadSession, completing *repository.UploadSession) error {
-	staged := completing.StagedPath
-	if staged == "" {
-		return errors.New("staged path missing")
-	}
-	// Pre-flight: every chunk file must exist (else report precise missing set).
-	var missing []int
-	for i := 0; i < session.TotalChunks; i++ {
-		if _, err := os.Stat(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, i)); err != nil {
-			if os.IsNotExist(err) {
-				missing = append(missing, i)
-			} else {
-				return fmt.Errorf("unable to stat chunk %d: %w", i, err)
-			}
-		}
-	}
-	if len(missing) > 0 {
-		return &repository.MissingChunksError{Missing: missing}
-	}
-	if err := storage.AssembleChunks(a.Settings.FileStorageDir, session.ID, session.TotalChunks, staged, session.FileSize); err != nil {
-		// Translate a mid-assembly disappearance into a resume hint.
-		var missingChunk *storage.MissingChunkError
-		if errors.As(err, &missingChunk) {
-			// Re-scan to build the accurate missing set.
-			missing = missing[:0]
-			for i := 0; i < session.TotalChunks; i++ {
-				if _, statErr := os.Stat(storage.ChunkFilePath(a.Settings.FileStorageDir, session.ID, i)); statErr != nil {
-					if os.IsNotExist(statErr) {
-						missing = append(missing, i)
-					}
-				}
-			}
-			if len(missing) > 0 {
-				return &repository.MissingChunksError{Missing: missing}
-			}
-		}
-		return err
-	}
-	// Post-verify size on disk (defense in depth against disk corruption).
-	info, err := os.Stat(staged)
-	if err != nil {
-		return fmt.Errorf("unable to verify assembled file: %w", err)
-	}
-	if info.Size() != session.FileSize {
-		_ = os.Remove(staged)
-		return fmt.Errorf("assembled size mismatch: got %d, want %d", info.Size(), session.FileSize)
-	}
-	return nil
-}
-
 // preValidateCompleteClip re-checks the session-frozen clip params (owner,
-// expiry, token ownership) before any assembly IO, so a doomed complete never
-// burns a merge.
+// expiry, token ownership) before any state change, so a doomed complete never
+// flips the session.
 func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, session *repository.UploadSession) bool {
 	// init requires environmentId, so these two guards only fire for rows
 	// written by a pre-upgrade version. Such a session has no owner and no clip
@@ -866,9 +817,10 @@ func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, se
 	return true
 }
 
-// createClipFromCompletedUpload inserts the file clip referencing the staged
-// file, using the params captured on the session at init. There is no
-// "file-only" alternative: this is the only success path of COMPLETE.
+// createClipFromCompletedUpload inserts the file clip against the session's
+// pre-allocated file, using the params captured on the session at init. There is
+// no "file-only" alternative: this is the only success path of COMPLETE. The file
+// is already at its final path, so no move/copy happens here.
 //
 // It re-checks the invariants that a concurrent upload can break while this
 // session was streaming chunks:
@@ -877,8 +829,8 @@ func (a *App) preValidateCompleteClip(w http.ResponseWriter, r *http.Request, se
 //     atomically by CreateClip through the UNIQUE index on clips.access_code);
 //   - an expiry that elapsed during the upload   -> value error (400).
 //
-// Callers must roll the session back (FailComplete) on error and delete the
-// orphan staged file.
+// Callers must roll the session back (FailComplete) on error; the file and the
+// receipts stay valid for a retry.
 func (a *App) createClipFromCompletedUpload(session *repository.UploadSession, completing *repository.UploadSession) (*models.Clip, error) {
 	stored := &models.StoredFile{
 		Name: session.Filename, Size: session.FileSize, Mime: session.MimeType, Path: completing.StagedPath,
@@ -920,104 +872,100 @@ func (a *App) writeClipCreationError(w http.ResponseWriter, err error) {
 // ---------------------------------------------------------------------------
 
 // ReconcileUploadsOnStartup purges expired sessions, rolls back `completing`
-// rows left by a crash, re-syncs DB receipts with files on disk, and sweeps
-// orphan chunk dirs + orphan assembly temps. All DB work uses short locks;
-// all file IO runs outside locks.
+// rows left by a crash, sweeps orphan storage files (and leftovers of the old
+// per-chunk layout). All DB work uses short locks; all file IO runs outside
+// locks. Progress itself needs no reconciliation: upload_chunks is authoritative.
 func (a *App) ReconcileUploadsOnStartup() {
 	now := time.Now().UTC().Unix()
 	// 1) Expired sessions (timeout rollback).
 	if victims, err := a.Repo.PurgeExpiredUploads(now); err != nil {
 		a.logger.Printf("ERROR:    upload expiry purge failed: %v", err)
 	} else {
-		for _, v := range victims {
-			_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, v.UploadID)
-			if v.StagedPath != "" && !v.HasClip {
-				_ = os.Remove(v.StagedPath)
-				matches, _ := filepath.Glob(v.StagedPath + ".part.*")
-				for _, m := range matches {
-					_ = os.Remove(m)
-				}
-			}
-		}
+		a.deleteUploadVictimFiles(victims)
 		if len(victims) > 0 {
 			a.logger.Printf("INFO:     startup upload purge removed %d expired session(s)", len(victims))
 		}
 	}
-	// 2) `completing` rows stuck by power loss -> back to active.
+	// 2) `completing` rows stuck by power loss -> back to active. Their file and
+	// receipts are kept (they are exactly what a retried COMPLETE needs).
 	if stuck, err := a.Repo.ResetStuckCompleting(); err != nil {
 		a.logger.Printf("ERROR:    upload completing reset failed: %v", err)
-	} else {
-		for _, s := range stuck {
-			_ = os.Remove(storage.AssembledTempPath(a.Settings.FileStorageDir, s.UploadID))
-			if s.StagedPath != "" {
-				_ = os.Remove(s.StagedPath)
-				matches, _ := filepath.Glob(s.StagedPath + ".part.*")
-				for _, m := range matches {
-					_ = os.Remove(m)
-				}
-			}
-		}
-		if len(stuck) > 0 {
-			a.logger.Printf("INFO:     startup upload recovery reset %d interrupted session(s) to active", len(stuck))
-		}
+	} else if len(stuck) > 0 {
+		a.logger.Printf("INFO:     startup upload recovery reset %d interrupted session(s) to active", len(stuck))
 	}
-	// 3) Per-session disk<->DB re-sync (active sessions only).
-	sessions, err := a.Repo.ListUploadSessions()
-	if err != nil {
-		a.logger.Printf("ERROR:    unable to list upload sessions for reconcile: %v", err)
-	} else {
-		for _, s := range sessions {
-			if s.Status == repository.UploadStatusCompleted {
-				// Chunks should already be gone; sweep leftovers (crash between
-				// commit and dir removal).
-				_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, s.ID)
-				continue
-			}
-			received, err := a.Repo.ListReceivedChunks(s.ID)
-			if err != nil {
-				continue
-			}
-			_ = a.reconcileDiskState(s, received)
-			// Drop stray assembled temps (crash before ResetStuckCompleting?).
-			_ = os.Remove(storage.AssembledTempPath(a.Settings.FileStorageDir, s.ID))
-		}
-	}
-	// 4) Orphan chunk dirs (PUT raced DELETE, or manual DB loss).
-	if dirs, err := storage.ListUploadDirsOnDisk(a.Settings.FileStorageDir); err != nil {
-		a.logger.Printf("ERROR:    unable to list upload dirs: %v", err)
-	} else {
-		for _, id := range dirs {
-			exists, err := a.Repo.UploadSessionExists(id)
-			if err != nil || exists {
-				continue
-			}
-			_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, id)
-			a.logger.Printf("INFO:     removed orphan upload dir %s", id)
-		}
-	}
-	// 5) Orphan assembly temps in the file root (*.part.* with no session ref).
-	// Only on startup (no in-flight assemblies), so deletion is safe.
-	if entries, err := os.ReadDir(a.Settings.FileStorageDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			if strings.Contains(e.Name(), ".part.") {
-				_ = os.Remove(filepath.Join(a.Settings.FileStorageDir, e.Name()))
-			}
-		}
-	}
-	// 6) Upload quota ledger: an upgrade from a pre-quota database (or a crash
+	// 3) Orphan storage files: everything that neither a live session nor a clip
+	// references (a crash between INSERT and file creation, or manual leftovers).
+	// Legacy per-chunk layout from the previous version is removed as a whole.
+	a.sweepOrphanUploadFiles()
+	// 4) Upload quota ledger: an upgrade from a pre-quota database (or a crash
 	// between "reserve" and "insert") may leave the counter drifting.
 	a.reconcileUploadQuota()
-	// 7) Stored-clip ledger: an upgrade from a pre-quota database (or a crash
+	// 5) Stored-clip ledger: an upgrade from a pre-quota database (or a crash
 	// between "charge" and "commit") may leave the saved-bytes counter drifting.
 	a.reconcileClipQuota()
 }
 
+// sweepOrphanUploadFiles deletes storage files no row references, plus any
+// leftovers of the legacy chunk layout (<dir>/uploads/<id>/chunk-XXXXXX and
+// *.part.* temps). It never touches a file that a session or a clip owns, so
+// clip data is safe even if a session row was purged.
+func (a *App) sweepOrphanUploadFiles() {
+	referenced, err := a.Repo.ReferencedFilePaths()
+	if err != nil {
+		a.logger.Printf("ERROR:    unable to list referenced storage paths: %v", err)
+		return
+	}
+	names, err := storage.ListStorageFiles(a.Settings.FileStorageDir)
+	if err != nil {
+		a.logger.Printf("ERROR:    unable to list storage dir: %v", err)
+		return
+	}
+	removed := 0
+	for _, name := range names {
+		if strings.Contains(name, ".part.") {
+			// Legacy assembly temp: always orphan (no code path writes them).
+			if err := storage.RemoveUploadFile(filepath.Join(a.Settings.FileStorageDir, name)); err == nil {
+				removed++
+			}
+			continue
+		}
+		path := filepath.Join(a.Settings.FileStorageDir, name)
+		if referenced[path] {
+			continue
+		}
+		if err := storage.RemoveUploadFile(path); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		a.logger.Printf("INFO:     startup sweep removed %d orphan storage file(s)", removed)
+	}
+	// Legacy per-session chunk directories are useless to this version (a legacy
+	// session has no pre-allocated file and cannot be completed): drop them so an
+	// upgrade does not keep the old bytes forever.
+	legacyDir := storage.LegacyUploadRoot(a.Settings.FileStorageDir)
+	if entries, err := os.ReadDir(legacyDir); err == nil && len(entries) > 0 {
+		if err := os.RemoveAll(legacyDir); err != nil {
+			a.logger.Printf("WARN:     unable to remove legacy chunk dir %s: %v", legacyDir, err)
+		} else {
+			a.logger.Printf("INFO:     removed legacy chunk layout (%d dirs) under %s", len(entries), legacyDir)
+		}
+	}
+}
+
+// deleteUploadVictimFiles removes the pre-allocated file of every purged session
+// that never produced a clip.
+func (a *App) deleteUploadVictimFiles(victims []repository.UploadPurgeVictim) {
+	for _, v := range victims {
+		if v.StagedPath != "" && !v.HasClip {
+			_ = storage.RemoveUploadFile(v.StagedPath)
+		}
+	}
+}
+
 // reconcileUploadQuota recomputes the reserved bytes from live sessions and
-// overwrites the ledger, then logs the result. It only fixes the counter --
-// no chunk dir and no clip file is touched.
+// overwrites the ledger, then logs the result. It only fixes the counter -- no
+// upload file and no clip file is touched.
 func (a *App) reconcileUploadQuota() {
 	recomputed, previous, err := a.Repo.RecomputeUploadQuota()
 	if err != nil {
@@ -1060,14 +1008,5 @@ func (a *App) purgeExpiredUploadsPeriodic() {
 		a.logger.Printf("ERROR:    upload cleanup worker failed: %v", err)
 		return
 	}
-	for _, v := range victims {
-		_ = storage.RemoveUploadDir(a.Settings.FileStorageDir, v.UploadID)
-		if v.StagedPath != "" && !v.HasClip {
-			_ = os.Remove(v.StagedPath)
-			matches, _ := filepath.Glob(v.StagedPath + ".part.*")
-			for _, m := range matches {
-				_ = os.Remove(m)
-			}
-		}
-	}
+	a.deleteUploadVictimFiles(victims)
 }

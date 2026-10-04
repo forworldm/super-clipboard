@@ -3,18 +3,25 @@
 // Design notes (read before modifying):
 //
 //   - Sessions are persisted in SQLite (upload_sessions + upload_chunks) so a
-//     power failure / process restart does not lose resume state. Chunk bytes
-//     live on disk under <FileStorageDir>/uploads/<uploadId>/chunk-XXXXXX.
+//     power failure / process restart does not lose resume state. The byte
+//     container is ONE file per session: it is pre-allocated by INIT at its
+//     FINAL path (upload_sessions.staged_path, truncate(file_size)) and every
+//     chunk is written in place at index*chunk_size. There are no per-chunk
+//     files, no assembly step and no second copy of the bytes.
+//   - upload_chunks is therefore the SINGLE source of truth for progress: a row
+//     means "this byte range was written and synced". Nothing else is consulted
+//     to answer "which chunks do I still need?".
 //   - Concurrency: the global r.mu serialises short DB transactions only. File
-//     IO (chunk writes, assembly, deletions) ALWAYS happens outside r.mu so a
-//     slow disk or a 50MB assembly never blocks unrelated uploads/clips.
-//     Cross-operation races (PUT vs COMPLETE vs DELETE) are resolved with
-//     atomic SQL predicates (e.g. UPDATE ... WHERE status='active') plus
-//     atomic file renames; see handlers for the protocol.
-//   - Crash recovery: COMPLETE flips active->completing (recording the staged
-//     path) before any assembly IO. If the server dies mid-assembly the row
-//     stays in `completing` and startup reconciliation (ResetStuckCompleting
-//   - orphan sweeps) rolls it back to `active`.
+//     IO (chunk writes, deletions) ALWAYS happens outside r.mu, and chunk writes
+//     target disjoint byte ranges, so a slow disk never blocks unrelated
+//     uploads/clips. Cross-operation races (PUT vs COMPLETE vs DELETE) are
+//     resolved with atomic SQL predicates (e.g. UPDATE ... WHERE status='active')
+//     plus the receipt table; see handlers for the protocol.
+//   - Crash recovery: COMPLETE flips active->completing before inserting the
+//     clip. The flip is a pure concurrency guard now (there is no long IO to
+//     cover); a row left in `completing` by a power loss is rolled back to
+//     `active` by startup reconciliation (ResetStuckCompleting), keeping its
+//     pre-allocated file and its receipts.
 package repository
 
 import (
@@ -53,7 +60,7 @@ type UploadSession struct {
 	CreatedAt     int64  // unix seconds
 	UpdatedAt     int64  // unix seconds
 	ExpiresAt     int64  // unix seconds
-	StagedPath    string // final assembled file (set when completing/completed)
+	StagedPath    string // pre-allocated FINAL file, created by init ("" only on legacy rows)
 	ClipID        string // clip inserted by complete (empty only mid-upload)
 	// QuotaReleased reports whether this session already returned its upload
 	// quota reservation. The flag + a CAS UPDATE makes release idempotent:
@@ -95,6 +102,16 @@ func (s *UploadSession) ExpectedChunkSize(index int) (int64, bool) {
 		remainder = 0
 	}
 	return remainder, true
+}
+
+// ChunkOffset returns the byte offset a chunk index must be written at.
+// It is derived from (index, chunkSize) only, so the offset is known as soon as
+// init fixed the chunk size, i.e. before a single byte was transferred.
+func (s *UploadSession) ChunkOffset(index int) (int64, bool) {
+	if s == nil || index < 0 || index >= s.TotalChunks || s.ChunkSize <= 0 {
+		return 0, false
+	}
+	return int64(index) * int64(s.ChunkSize), true
 }
 
 // MissingChunks computes sorted missing indices from a received list.
@@ -191,6 +208,11 @@ type CreateUploadSessionParams struct {
 	ClipMaxDownloads *int
 	ClipAccessCode   *string
 	ClipAccessToken  *string
+	// StagedPath is the FINAL storage path of the upload, chosen by the caller
+	// (storage.FinalStoragePath) before the row exists. The file is created and
+	// sized to FileSize right after the insert, so the session row and the byte
+	// container are born together and COMPLETE never has to move the file.
+	StagedPath string
 }
 
 // normalizeUploadParams applies defaults and validates an init request.
@@ -206,6 +228,10 @@ func (r *ClipRepository) normalizeUploadParams(params CreateUploadSessionParams)
 	if environmentID == "" {
 		return nil, errors.New("environment id is required for every upload session")
 	}
+	// StagedPath stays optional at this layer: rows written by an older version
+	// have none, and they are refused by COMPLETE (which needs the file). Every
+	// session created by the API carries one from init.
+	stagedPath := strings.TrimSpace(params.StagedPath)
 	chunkSize := params.ChunkSize
 	if chunkSize <= 0 {
 		chunkSize = r.settings.EffectiveChunkSize()
@@ -225,7 +251,10 @@ func (r *ClipRepository) normalizeUploadParams(params CreateUploadSessionParams)
 		MimeType: mime, ChunkSize: chunkSize, TotalChunks: total,
 		Status: UploadStatusActive, EnvironmentID: environmentID,
 		RequestID: strings.TrimSpace(params.RequestID),
-		CreatedAt: now, UpdatedAt: now, ExpiresAt: now + int64(ttl),
+		// The byte container path is frozen at init: it is already the final clip
+		// path, so COMPLETE inserts the clip against it without moving any byte.
+		StagedPath: stagedPath,
+		CreatedAt:  now, UpdatedAt: now, ExpiresAt: now + int64(ttl),
 		// Clip params are stored for every session: COMPLETE always creates the
 		// clip from them (there is no "regular file upload").
 		ClipExpiresAt:    params.ClipExpiresAt,
@@ -253,11 +282,11 @@ func (r *ClipRepository) insertUploadSession(session *UploadSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, err := r.db.Exec(`INSERT INTO upload_sessions (`+uploadColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?, ?, ?)`,
 		session.ID, session.Filename, session.FileSize, session.MimeType,
 		session.ChunkSize, session.TotalChunks, session.Status,
 		session.EnvironmentID, session.CreatedAt, session.UpdatedAt, session.ExpiresAt,
-		nullIfEmpty(session.RequestID),
+		nullIfEmpty(session.StagedPath), nullIfEmpty(session.RequestID),
 		nullInt64Zero(session.ClipExpiresAt),
 		nullIntPtr(session.ClipMaxDownloads),
 		nullStringPtr(session.ClipAccessCode),
@@ -435,9 +464,15 @@ func (r *ClipRepository) GetUploadSessionWithChunks(uploadID string) (*UploadSes
 	return session, received, nil
 }
 
-// MarkChunkReceived upserts a chunk receipt and bumps updated_at.
-// It validates the session is still active/completing-eligible; callers must
-// have already durably written the chunk file (IO outside the lock).
+// MarkChunkReceived upserts a chunk receipt and bumps updated_at. This is the
+// commit point of a chunk: the bytes were already written (and synced) into the
+// session's pre-allocated file at index*chunk_size, so the row is what turns a
+// byte range into "received".
+//
+// The recorded size MUST equal the chunk's byte range: every chunk but the last
+// one carries exactly chunk_size bytes, the last one carries the remainder. A
+// mismatching receipt is refused (ErrChunkSizeMismatch) instead of being stored,
+// so the table can never claim a range that was not fully written.
 func (r *ClipRepository) MarkChunkReceived(uploadID string, index int, size int64) error {
 	if strings.TrimSpace(uploadID) == "" || index < 0 || size < 0 {
 		return errors.New("invalid chunk receipt")
@@ -451,9 +486,11 @@ func (r *ClipRepository) MarkChunkReceived(uploadID string, index int, size int6
 	}
 	defer tx.Rollback() //nolint:errcheck
 	var status string
-	var total int
+	var total, chunkSize int
+	var fileSize int64
 	if err := tx.QueryRow(
-		"SELECT status, total_chunks FROM upload_sessions WHERE id = ?", uploadID).Scan(&status, &total); err != nil {
+		"SELECT status, total_chunks, chunk_size, file_size FROM upload_sessions WHERE id = ?", uploadID).
+		Scan(&status, &total, &chunkSize, &fileSize); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return sql.ErrNoRows
 		}
@@ -462,8 +499,16 @@ func (r *ClipRepository) MarkChunkReceived(uploadID string, index int, size int6
 	if status == UploadStatusCompleted {
 		return ErrUploadAlreadyCompleted
 	}
-	if index >= total {
+	if index >= total || chunkSize <= 0 {
 		return ErrChunkIndexOutOfRange
+	}
+	probe := &UploadSession{ChunkSize: chunkSize, TotalChunks: total, FileSize: fileSize}
+	expected, ok := probe.ExpectedChunkSize(index)
+	if !ok {
+		return ErrChunkIndexOutOfRange
+	}
+	if size != expected {
+		return &ChunkSizeMismatchError{Index: index, Got: size, Want: expected}
 	}
 	if _, err := tx.Exec(`INSERT INTO upload_chunks (upload_id, chunk_index, size, received_at)
 		VALUES (?, ?, ?, ?)
@@ -485,11 +530,26 @@ type MissingChunksError struct {
 
 func (e *MissingChunksError) Error() string { return "chunks missing" }
 
-// TryBeginComplete atomically transitions active->completing (recording the
-// staged path for crash recovery) after verifying every chunk is present.
-// On success the caller owns assembly IO outside the lock; on failure the
-// session stays active for retry/resume.
-func (r *ClipRepository) TryBeginComplete(uploadID string, stagedPath string) (*UploadSession, []int, error) {
+// ChunkSizeMismatchError reports a chunk whose payload did not match its byte
+// range (non-last chunks: exactly chunk_size; last chunk: the remainder).
+type ChunkSizeMismatchError struct {
+	Index int
+	Got   int64
+	Want  int64
+}
+
+func (e *ChunkSizeMismatchError) Error() string {
+	return "chunk size does not match its byte range"
+}
+
+// TryBeginComplete atomically transitions active->completing after verifying
+// every chunk of the session has a receipt in the database.
+//
+// The transition only guards against concurrent completers (it no longer covers
+// any assembly IO: the bytes already sit in their final place). On success the
+// caller inserts the clip and flips to completed; on failure the session stays
+// active so the client can resume.
+func (r *ClipRepository) TryBeginComplete(uploadID string) (*UploadSession, []int, error) {
 	now := nowUnix()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -539,9 +599,9 @@ func (r *ClipRepository) TryBeginComplete(uploadID string, stagedPath string) (*
 	if missing := MissingChunks(session.TotalChunks, received); len(missing) > 0 {
 		return nil, nil, &MissingChunksError{Missing: missing}
 	}
-	res, err := tx.Exec(`UPDATE upload_sessions SET status = ?, staged_path = ?, updated_at = ?
+	res, err := tx.Exec(`UPDATE upload_sessions SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`,
-		UploadStatusCompleting, nullIfEmpty(stagedPath), now, uploadID, UploadStatusActive)
+		UploadStatusCompleting, now, uploadID, UploadStatusActive)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -556,7 +616,6 @@ func (r *ClipRepository) TryBeginComplete(uploadID string, stagedPath string) (*
 		return nil, nil, err
 	}
 	session.Status = UploadStatusCompleting
-	session.StagedPath = stagedPath
 	session.UpdatedAt = now
 	sort.Ints(received)
 	return session, received, nil
@@ -659,8 +718,10 @@ func (r *ClipRepository) CompleteUploadSession(uploadID string, clipID string) (
 	return session, nil
 }
 
-// FailComplete rolls completing->active (clearing staged_path) so a failed
-// assembly can be retried. Returns the previous staged path for file cleanup.
+// FailComplete rolls completing->active so a failed clip insert can be retried.
+// The pre-allocated file and the chunk receipts are KEPT: the bytes are already
+// in their final place, so nothing has to be undone -- the client can simply
+// call COMPLETE again (or abort). Returns the storage path (which stays valid).
 func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 	now := nowUnix()
 	r.mu.Lock()
@@ -678,12 +739,12 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 		}
 		return "", err
 	}
-	if _, err := tx.Exec(`UPDATE upload_sessions SET status = ?, staged_path = NULL, updated_at = ?
+	if _, err := tx.Exec(`UPDATE upload_sessions SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`,
 		UploadStatusActive, now, uploadID, UploadStatusCompleting); err != nil {
 		return "", err
 	}
-	// The session goes back to `active` and KEEPS its chunks on disk, so it must
+	// The session goes back to `active` and KEEPS its bytes on disk, so it must
 	// keep its quota reservation as well: releasing here would leave live bytes
 	// unaccounted for (a quota bypass for up to the session TTL) and contradict
 	// RecomputeUploadQuota, which sums file_size over active sessions that still
@@ -817,8 +878,10 @@ type StuckCompleting struct {
 	StagedPath string
 }
 
-// ResetStuckCompleting rolls every `completing` row back to `active` (clearing
-// staged_path) and returns them for temp-file cleanup outside the lock.
+// ResetStuckCompleting rolls every `completing` row back to `active` (a power
+// loss between the CAS and the clip insert). The pre-allocated file and the
+// chunk receipts stay untouched: they are still exactly what the client needs to
+// retry COMPLETE, so recovery is a single status update with no file IO.
 func (r *ClipRepository) ResetStuckCompleting() ([]StuckCompleting, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -845,7 +908,7 @@ func (r *ClipRepository) ResetStuckCompleting() ([]StuckCompleting, error) {
 		return nil, nil
 	}
 	now := time.Now().UTC().Unix()
-	if _, err := r.db.Exec(`UPDATE upload_sessions SET status = ?, staged_path = NULL, updated_at = ?
+	if _, err := r.db.Exec(`UPDATE upload_sessions SET status = ?, updated_at = ?
 		WHERE status = ?`, UploadStatusActive, now, UploadStatusCompleting); err != nil {
 		return nil, err
 	}
@@ -870,12 +933,12 @@ func (r *ClipRepository) ListUploadSessions() ([]*UploadSession, error) {
 	return out, rows.Err()
 }
 
-// DeleteChunkRecords removes receipts for chunks whose files vanished (disk
-// loss / partial cleanup) so GET accurately reports them as missing.
-func (r *ClipRepository) DeleteChunkRecords(uploadID string, indices []int) error {
-	if len(indices) == 0 {
-		return nil
-	}
+// ClearChunkReceipts drops every receipt of a session. It is the recovery path
+// for a lost/re-created byte container: the pre-allocated file is truncated back
+// to zero content, so no range can be trusted anymore and the whole upload has
+// to be sent again. (The old disk-scanning reconcile -- "DB says yes, disk says
+// no" -- disappears with the per-chunk files.)
+func (r *ClipRepository) ClearChunkReceipts(uploadID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	tx, err := r.db.Begin()
@@ -883,11 +946,8 @@ func (r *ClipRepository) DeleteChunkRecords(uploadID string, indices []int) erro
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	for _, idx := range indices {
-		if _, err := tx.Exec(
-			"DELETE FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?", uploadID, idx); err != nil {
-			return err
-		}
+	if _, err := tx.Exec("DELETE FROM upload_chunks WHERE upload_id = ?", uploadID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(
 		"UPDATE upload_sessions SET updated_at = ? WHERE id = ?", nowUnix(), uploadID); err != nil {
@@ -896,33 +956,62 @@ func (r *ClipRepository) DeleteChunkRecords(uploadID string, indices []int) erro
 	return tx.Commit()
 }
 
-// RestoreChunkRecords re-adds receipts for chunk files found on disk but
-// missing in DB (crash between file rename and DB commit).
-func (r *ClipRepository) RestoreChunkRecords(uploadID string, indexToSize map[int]int64) error {
-	if len(indexToSize) == 0 {
+// DeleteChunkReceipt drops the receipt of a single chunk index. It is used when
+// a retried PUT left a partially overwritten (or oversized) range: the range must
+// not be advertised as complete, so the client re-sends that chunk.
+func (r *ClipRepository) DeleteChunkReceipt(uploadID string, index int) error {
+	if strings.TrimSpace(uploadID) == "" || index < 0 {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	tx, err := r.db.Begin()
+	_, err := r.db.Exec(
+		"DELETE FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?", uploadID, index)
+	return err
+}
+
+// ReferencedFilePaths returns every storage path that is still owned by a live
+// upload session or by an existing clip. Startup reconciliation uses it to sweep
+// files that no row points at (a crash between INSERT and file creation, or a
+// hand-copied leftovers) without ever touching clip data.
+func (r *ClipRepository) ReferencedFilePaths() (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := r.db.Query("SELECT staged_path FROM upload_sessions WHERE staged_path IS NOT NULL")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer tx.Rollback() //nolint:errcheck
-	now := nowUnix()
-	for idx, size := range indexToSize {
-		if _, err := tx.Exec(`INSERT INTO upload_chunks (upload_id, chunk_index, size, received_at)
-			VALUES (?, ?, ?, ?)
-			ON CONFLICT(upload_id, chunk_index) DO UPDATE SET size=excluded.size, received_at=excluded.received_at`,
-			uploadID, idx, size, now); err != nil {
-			return err
+	for rows.Next() {
+		var path sql.NullString
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if path.Valid && path.String != "" {
+			out[path.String] = true
 		}
 	}
-	if _, err := tx.Exec(
-		"UPDATE upload_sessions SET updated_at = ? WHERE id = ?", now, uploadID); err != nil {
-		return err
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return tx.Commit()
+	clipRows, err := r.db.Query("SELECT file_path FROM clips WHERE file_path IS NOT NULL")
+	if err != nil {
+		return nil, err
+	}
+	defer clipRows.Close()
+	for clipRows.Next() {
+		var path sql.NullString
+		if err := clipRows.Scan(&path); err != nil {
+			return nil, err
+		}
+		if path.Valid && path.String != "" {
+			out[path.String] = true
+		}
+	}
+	if err := clipRows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // UploadSessionExists is a cheap existence probe for orphan-dir sweeps.

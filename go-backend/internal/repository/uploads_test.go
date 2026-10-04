@@ -195,10 +195,10 @@ func TestTryBeginCompleteFlow(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 2000, ChunkSize: 1000, TTLSeconds: 3600,
-
+		StagedPath:    "/tmp/staged",
 		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(s.ID, 0, 1000)
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/staged"); err == nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err == nil {
 		t.Fatalf("should fail with missing chunks")
 	} else {
 		var missing *MissingChunksError
@@ -214,18 +214,18 @@ func TestTryBeginCompleteFlow(t *testing.T) {
 		t.Fatalf("status should stay active, got %s", cur.Status)
 	}
 	_ = repo.MarkChunkReceived(s.ID, 1, 1000)
-	completing, received, err := repo.TryBeginComplete(s.ID, "/tmp/staged")
+	completing, received, err := repo.TryBeginComplete(s.ID)
 	if err != nil {
 		t.Fatalf("begin complete: %v", err)
 	}
-	if completing.Status != UploadStatusCompleting || completing.StagedPath != "/tmp/staged" {
+	if completing.Status != UploadStatusCompleting || completing.StagedPath != s.StagedPath {
 		t.Fatalf("unexpected %+v", completing)
 	}
 	if len(received) != 2 {
 		t.Fatalf("expected 2 received, got %v", received)
 	}
 	// Second concurrent completer must lose.
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/other"); err == nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err == nil {
 		t.Fatalf("second begin should fail")
 	} else {
 		var c *SessionCompletingError
@@ -233,15 +233,19 @@ func TestTryBeginCompleteFlow(t *testing.T) {
 			t.Fatalf("expected CompletingError, got %T", err)
 		}
 	}
-	// Rollback then retry.
+	// Rollback then retry: the pre-allocated file + receipts survive, because the
+	// bytes are already in their final place and only the clip insert failed.
 	staged, err := repo.FailComplete(s.ID)
-	if err != nil || staged != "/tmp/staged" {
+	if err != nil || staged != s.StagedPath {
 		t.Fatalf("fail complete: %v %q", err, staged)
 	}
-	if cur, _ := repo.GetUploadSession(s.ID); cur.Status != UploadStatusActive || cur.StagedPath != "" {
-		t.Fatalf("should roll back to active, got %+v", cur)
+	if cur, _ := repo.GetUploadSession(s.ID); cur.Status != UploadStatusActive || cur.StagedPath != s.StagedPath {
+		t.Fatalf("should roll back to active keeping its storage path, got %+v", cur)
 	}
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/staged2"); err != nil {
+	if got, _ := repo.ListReceivedChunks(s.ID); len(got) != 2 {
+		t.Fatalf("receipts must survive the rollback, got %v", got)
+	}
+	if _, _, err := repo.TryBeginComplete(s.ID); err != nil {
 		t.Fatalf("retry begin: %v", err)
 	}
 	completed, err := repo.CompleteUploadSession(s.ID, "clip-1")
@@ -251,7 +255,7 @@ func TestTryBeginCompleteFlow(t *testing.T) {
 	if completed.Status != UploadStatusCompleted || completed.ClipID != "clip-1" {
 		t.Fatalf("unexpected %+v", completed)
 	}
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/x"); err == nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err == nil {
 		t.Fatalf("completed session should reject begin")
 	} else {
 		var c *SessionCompletedError
@@ -286,7 +290,7 @@ func TestAbortUploadSession(t *testing.T) {
 		Filename: "b.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 60,
 
 		EnvironmentID: "env-test"})
-	if _, _, err := repo.TryBeginComplete(s2.ID, "/tmp/s"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s2.ID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if _, err := repo.CompleteUploadSession(s2.ID, "clip-9"); err != nil {
@@ -300,7 +304,7 @@ func TestAbortUploadSession(t *testing.T) {
 		Filename: "c.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 60,
 
 		EnvironmentID: "env-test"})
-	if _, _, err := repo.TryBeginComplete(s3.ID, "/tmp/s3"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s3.ID); err != nil {
 		t.Fatalf("begin s3: %v", err)
 	}
 	if _, err := repo.CompleteUploadSession(s3.ID, ""); err != nil {
@@ -349,9 +353,9 @@ func TestResetStuckCompleting(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 0, ChunkSize: 1000, TTLSeconds: 3600,
-
+		StagedPath:    "/tmp/stuck",
 		EnvironmentID: "env-test"})
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/stuck"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	stuck, err := repo.ResetStuckCompleting()
@@ -361,8 +365,8 @@ func TestResetStuckCompleting(t *testing.T) {
 	if len(stuck) != 1 || stuck[0].UploadID != s.ID || stuck[0].StagedPath != "/tmp/stuck" {
 		t.Fatalf("unexpected stuck %v", stuck)
 	}
-	if cur, _ := repo.GetUploadSession(s.ID); cur.Status != UploadStatusActive || cur.StagedPath != "" {
-		t.Fatalf("should reset to active, got %+v", cur)
+	if cur, _ := repo.GetUploadSession(s.ID); cur.Status != UploadStatusActive || cur.StagedPath != "/tmp/stuck" {
+		t.Fatalf("should reset to active keeping its pre-allocated file, got %+v", cur)
 	}
 	if again, _ := repo.ResetStuckCompleting(); len(again) != 0 {
 		t.Fatalf("second reset should be empty, got %v", again)
@@ -422,7 +426,7 @@ func TestCreateOrGetUploadSession(t *testing.T) {
 	}
 }
 
-func TestDeleteAndRestoreChunkRecords(t *testing.T) {
+func TestClearChunkReceiptsAndDeleteOne(t *testing.T) {
 	repo := newTestRepository(t)
 	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
 		Filename: "a.bin", FileSize: 3000, ChunkSize: 1000, TTLSeconds: 60,
@@ -430,17 +434,23 @@ func TestDeleteAndRestoreChunkRecords(t *testing.T) {
 		EnvironmentID: "env-test"})
 	_ = repo.MarkChunkReceived(s.ID, 0, 1000)
 	_ = repo.MarkChunkReceived(s.ID, 1, 1000)
-	if err := repo.DeleteChunkRecords(s.ID, []int{1}); err != nil {
-		t.Fatalf("delete: %v", err)
+	// Dropping a single receipt makes exactly that range "missing" again (used
+	// when a retried PUT left a half-overwritten range behind).
+	if err := repo.DeleteChunkReceipt(s.ID, 1); err != nil {
+		t.Fatalf("delete receipt: %v", err)
 	}
 	if got, _ := repo.ListReceivedChunks(s.ID); len(got) != 1 || got[0] != 0 {
 		t.Fatalf("unexpected %v", got)
 	}
-	if err := repo.RestoreChunkRecords(s.ID, map[int]int64{1: 1000, 2: 1000}); err != nil {
-		t.Fatalf("restore: %v", err)
+	if err := repo.MarkChunkReceived(s.ID, 1, 1000); err != nil {
+		t.Fatalf("re-mark: %v", err)
 	}
-	if got, _ := repo.ListReceivedChunks(s.ID); len(got) != 3 {
-		t.Fatalf("unexpected %v", got)
+	// Clearing every receipt is the recovery path for a lost byte container.
+	if err := repo.ClearChunkReceipts(s.ID); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if got, _ := repo.ListReceivedChunks(s.ID); len(got) != 0 {
+		t.Fatalf("all receipts should be gone, got %v", got)
 	}
 	exists, err := repo.UploadSessionExists(s.ID)
 	if err != nil || !exists {
@@ -474,7 +484,7 @@ func TestFailCompleteKeepsQuotaReservation(t *testing.T) {
 	if err := repo.MarkChunkReceived(s.ID, 0, 700); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/rollback-staged"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if _, err := repo.FailComplete(s.ID); err != nil {
@@ -507,7 +517,7 @@ func TestPurgeExpiredUploadsSkipsCompleting(t *testing.T) {
 	if err := repo.MarkChunkReceived(s.ID, 0, 10); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/inflight-staged"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// TTL elapses while the merge is still running.
@@ -552,7 +562,7 @@ func TestInitReplayRefusesStaleInFlightSession(t *testing.T) {
 	if err := repo.MarkChunkReceived(s.ID, 0, 100); err != nil {
 		t.Fatalf("mark chunk: %v", err)
 	}
-	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/stale-staged"); err != nil {
+	if _, _, err := repo.TryBeginComplete(s.ID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if _, err := repo.db.Exec("UPDATE upload_sessions SET expires_at = ? WHERE id = ?",

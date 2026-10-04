@@ -72,6 +72,26 @@ func initUploadBody(t *testing.T, app *App, body map[string]interface{}) map[str
 	return decode(t, rec)
 }
 
+// storageFileNames lists the upload containers owned by a test app.
+func storageFileNames(t *testing.T, app *App) []string {
+	t.Helper()
+	names, err := storage.ListStorageFiles(app.Settings.FileStorageDir)
+	if err != nil {
+		t.Fatalf("list storage files: %v", err)
+	}
+	return names
+}
+
+// sessionPath returns the pre-allocated container path of an upload session.
+func sessionPath(t *testing.T, app *App, uploadID string) string {
+	t.Helper()
+	session, _ := app.Repo.GetUploadSession(uploadID)
+	if session == nil || session.StagedPath == "" {
+		t.Fatalf("session %s should own a pre-allocated file: %+v", uploadID, session)
+	}
+	return session.StagedPath
+}
+
 func putChunk(t *testing.T, app *App, uploadID string, index int, data []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	return doRaw(t, app, http.MethodPut,
@@ -224,8 +244,8 @@ func TestUploadInitRequiresEnvironmentID(t *testing.T) {
 	if sessions, _ := app.Repo.ListUploadSessions(); len(sessions) != 0 {
 		t.Fatalf("a refused init must not persist a session, got %v", sessions)
 	}
-	if dirs, _ := storage.ListUploadDirsOnDisk(app.Settings.FileStorageDir); len(dirs) != 0 {
-		t.Fatalf("a refused init must not create a chunk dir, got %v", dirs)
+	if files := storageFileNames(t, app); len(files) != 0 {
+		t.Fatalf("a refused init must not allocate a storage file, got %v", files)
 	}
 }
 
@@ -309,15 +329,16 @@ func TestFullChunkedUploadCreatesNamelessClip(t *testing.T) {
 	if session.ClipID != clipID {
 		t.Fatalf("session must link the created clip, got %q want %q", session.ClipID, clipID)
 	}
-	assembled, err := os.ReadFile(session.StagedPath)
+	stored, err := os.ReadFile(session.StagedPath)
 	if err != nil {
-		t.Fatalf("read staged: %v", err)
+		t.Fatalf("read storage path: %v", err)
 	}
-	if !bytes.Equal(assembled, data) {
-		t.Fatalf("assembled bytes mismatch (got %d want %d)", len(assembled), len(data))
+	if !bytes.Equal(stored, data) {
+		t.Fatalf("stored bytes mismatch (got %d want %d)", len(stored), len(data))
 	}
-	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID)); !os.IsNotExist(err) {
-		t.Fatalf("chunk dir should be removed after complete")
+	// No merge copy exists: the session's file IS the clip's file.
+	if files := storageFileNames(t, app); len(files) != 1 {
+		t.Fatalf("expected exactly one storage file (no merge copy), got %v", files)
 	}
 
 	// The clip is listed for its environment owner (the only way a nameless
@@ -486,16 +507,20 @@ func TestCompleteDuplicateCodeRollback(t *testing.T) {
 	if !strings.Contains(conflict.Body.String(), "直链码已存在") {
 		t.Fatalf("unexpected body %s", conflict.Body.String())
 	}
-	// Rollback: session back to active, chunks intact, no staged orphan.
+	// Rollback: session back to active, its receipts and its container intact
+	// (the bytes already sit in their final position, so nothing is undone).
 	session, _ := app.Repo.GetUploadSession(id2)
 	if session.Status != "active" {
 		t.Fatalf("session should roll back to active, got %s", session.Status)
 	}
-	if session.StagedPath != "" {
-		t.Fatalf("rolled-back session must clear staged_path, got %q", session.StagedPath)
+	if session.StagedPath == "" {
+		t.Fatalf("rolled-back session must keep its pre-allocated file")
 	}
-	if _, err := os.Stat(storage.ChunkFilePath(app.Settings.FileStorageDir, id2, 0)); err != nil {
-		t.Fatalf("chunk must survive rollback: %v", err)
+	if received, _ := app.Repo.ListReceivedChunks(id2); len(received) != 1 {
+		t.Fatalf("receipts must survive the rollback, got %v", received)
+	}
+	if _, err := os.Stat(session.StagedPath); err != nil {
+		t.Fatalf("container must survive rollback: %v", err)
 	}
 	afterEntries, _ := os.ReadDir(app.Settings.FileStorageDir)
 	for _, e := range afterEntries {
@@ -549,6 +574,7 @@ func TestAbortAndCleanup(t *testing.T) {
 	init := initUpload(t, app, "cancel.bin", int64(len(data)), "application/octet-stream", "env-abort")
 	uploadID := init["uploadId"].(string)
 	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
+	stagedPath := sessionPath(t, app, uploadID)
 
 	del := do(t, app, http.MethodDelete, "/api/uploads/"+uploadID, nil)
 	requireStatus(t, del, http.StatusOK)
@@ -556,8 +582,8 @@ func TestAbortAndCleanup(t *testing.T) {
 	if rec := getUpload(t, app, uploadID); rec.Code != http.StatusNotFound {
 		t.Fatalf("GET after abort should 404, got %d", rec.Code)
 	}
-	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID)); !os.IsNotExist(err) {
-		t.Fatalf("chunk dir should be removed")
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Fatalf("pre-allocated file should be removed by abort (err=%v)", err)
 	}
 	if s, _ := app.Repo.GetUploadSession(uploadID); s != nil {
 		t.Fatalf("DB row should be gone")
@@ -585,6 +611,7 @@ func TestExpiredSessionHandling(t *testing.T) {
 	init := initUpload(t, app, "exp.bin", int64(len(data)), "application/octet-stream", "env-expired")
 	uploadID := init["uploadId"].(string)
 	requireStatus(t, putChunk(t, app, uploadID, 0, data), http.StatusOK)
+	stagedPath := sessionPath(t, app, uploadID)
 	// Force expiry.
 	if err := app.Repo.SetUploadExpiryForTest(uploadID, time.Now().Add(-time.Minute).Unix()); err != nil {
 		t.Fatalf("unable to expire session: %v", err)
@@ -596,8 +623,8 @@ func TestExpiredSessionHandling(t *testing.T) {
 	if rec := putChunk(t, app, uploadID, 0, data); rec.Code != http.StatusNotFound && rec.Code != http.StatusGone {
 		t.Fatalf("PUT expired should 404/410, got %d", rec.Code)
 	}
-	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, uploadID)); !os.IsNotExist(err) {
-		t.Fatalf("expired chunk dir should be cleaned")
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Fatalf("expired session's file should be cleaned (err=%v)", err)
 	}
 }
 
@@ -643,7 +670,9 @@ func TestConcurrentChunkUploads(t *testing.T) {
 	}
 }
 
-// TestCrashRecoveryResetStuck simulates power loss mid-assembly.
+// TestCrashRecoveryResetStuck simulates power loss right after the
+// active->completing CAS (before the clip insert) plus the file-level garbage a
+// crash can leave behind.
 func TestCrashRecoveryResetStuck(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
@@ -653,15 +682,17 @@ func TestCrashRecoveryResetStuck(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
 	}
-	// Simulate crash: flip to completing (as COMPLETE would) then "die" before commit.
-	if _, _, err := app.Repo.TryBeginComplete(uploadID, filepath.Join(app.Settings.FileStorageDir, "crash-partial.bin")); err != nil {
+	// Simulate crash: flip to completing (as COMPLETE would) then "die" before the
+	// clip insert.
+	if _, _, err := app.Repo.TryBeginComplete(uploadID); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	// Leave a partial staged file + temp behind.
-	_ = os.WriteFile(filepath.Join(app.Settings.FileStorageDir, "crash-partial.bin"), []byte("partial"), 0o644)
+	// File-level garbage a crash/upgrade can leave behind: a legacy assembly temp,
+	// a legacy per-chunk directory, and a stray file no row references.
 	_ = os.WriteFile(filepath.Join(app.Settings.FileStorageDir, "orphan.part.123"), []byte("t"), 0o644)
-	// Orphan chunk dir with no DB row.
-	_ = os.MkdirAll(storage.UploadSessionDir(app.Settings.FileStorageDir, "orphan-no-row"), 0o755)
+	_ = os.WriteFile(filepath.Join(app.Settings.FileStorageDir, "stray-no-row.bin"), []byte("x"), 0o644)
+	_ = os.MkdirAll(storage.LegacyUploadRoot(app.Settings.FileStorageDir)+"/orphan-no-row", 0o755)
+	_ = os.WriteFile(storage.LegacyUploadRoot(app.Settings.FileStorageDir)+"/orphan-no-row/chunk-000000", []byte("old"), 0o644)
 
 	app.ReconcileUploadsOnStartup()
 
@@ -669,14 +700,22 @@ func TestCrashRecoveryResetStuck(t *testing.T) {
 	if session.Status != "active" {
 		t.Fatalf("stuck session should reset to active, got %s", session.Status)
 	}
-	if _, err := os.Stat(filepath.Join(app.Settings.FileStorageDir, "crash-partial.bin")); !os.IsNotExist(err) {
-		t.Fatalf("partial staged file should be removed")
+	// Recovery must NOT touch the pre-allocated file nor the receipts: they are
+	// exactly what a retried COMPLETE needs.
+	if got, _ := app.Repo.ListReceivedChunks(uploadID); len(got) != 2 {
+		t.Fatalf("receipts must survive recovery, got %v", got)
+	}
+	if stored, err := os.ReadFile(session.StagedPath); err != nil || !bytes.Equal(stored, data) {
+		t.Fatalf("container must survive recovery: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(app.Settings.FileStorageDir, "orphan.part.123")); !os.IsNotExist(err) {
-		t.Fatalf("orphan part temp should be swept")
+		t.Fatalf("legacy part temp should be swept")
 	}
-	if _, err := os.Stat(storage.UploadSessionDir(app.Settings.FileStorageDir, "orphan-no-row")); !os.IsNotExist(err) {
-		t.Fatalf("orphan dir should be swept")
+	if _, err := os.Stat(filepath.Join(app.Settings.FileStorageDir, "stray-no-row.bin")); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced file should be swept")
+	}
+	if _, err := os.Stat(storage.LegacyUploadRoot(app.Settings.FileStorageDir)); !os.IsNotExist(err) {
+		t.Fatalf("legacy chunk layout should be removed")
 	}
 	// Chunks survived -> complete now succeeds and inserts the clip.
 	done := completeUpload(t, app, uploadID, nil)
@@ -685,14 +724,16 @@ func TestCrashRecoveryResetStuck(t *testing.T) {
 		t.Fatalf("expected file clip after recovery, got %s", done.Body.String())
 	}
 	session2, _ := app.Repo.GetUploadSession(uploadID)
-	assembled, _ := os.ReadFile(session2.StagedPath)
-	if !bytes.Equal(assembled, data) {
-		t.Fatalf("post-recovery assembly mismatch")
+	stored, _ := os.ReadFile(session2.StagedPath)
+	if !bytes.Equal(stored, data) {
+		t.Fatalf("post-recovery content mismatch")
 	}
 }
 
-// TestDiskLossReconcile covers chunk files deleted out-of-band.
-func TestDiskLossReconcile(t *testing.T) {
+// TestLostContainerRecovery covers the pre-allocated file being deleted
+// out-of-band: the receipts become lies, so COMPLETE must re-create the file,
+// drop every receipt and ask for the whole upload again.
+func TestLostContainerRecovery(t *testing.T) {
 	app := newTestApp(t, smallChunkSettings())
 	chunkSize := 64 << 10
 	data := deterministicBytes(chunkSize*2 + 100)
@@ -701,35 +742,43 @@ func TestDiskLossReconcile(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
 	}
-	// Simulate disk loss of chunk 1.
-	if err := os.Remove(storage.ChunkFilePath(app.Settings.FileStorageDir, uploadID, 1)); err != nil {
-		t.Fatalf("remove chunk: %v", err)
+	// Simulate disk loss: the whole container disappears.
+	staged := sessionPath(t, app, uploadID)
+	if err := os.Remove(staged); err != nil {
+		t.Fatalf("remove container: %v", err)
 	}
-	// GET reconciles and reports the gap.
+	// GET is served from the database (the receipts are still there) ...
 	infoRec := getUpload(t, app, uploadID)
 	requireStatus(t, infoRec, http.StatusOK)
-	missing := decode(t, infoRec)["missingChunks"].([]interface{})
-	if len(missing) != 1 || missing[0] != float64(1) {
-		t.Fatalf("GET should report [1] missing, got %v", missing)
+	if got := decode(t, infoRec)["receivedCount"]; got != float64(3) {
+		t.Fatalf("GET should report the recorded receipts, got %v", got)
 	}
-	// Complete surfaces the same gap.
+	// ... but COMPLETE notices that the bytes are gone, re-creates the container,
+	// clears every receipt and asks for the whole upload again.
 	early := completeUpload(t, app, uploadID, nil)
-	requireStatus(t, early, http.StatusBadRequest)
-	var body struct {
-		Detail  string `json:"detail"`
-		Missing []int  `json:"missing"`
+	requireStatus(t, early, http.StatusConflict)
+	if !strings.Contains(early.Body.String(), "重新上传全部分片") {
+		t.Fatalf("unexpected body %s", early.Body.String())
 	}
-	// Note: success uses lowercase keys; error detail uses FastAPI "Detail".
 	var raw map[string]interface{}
 	if err := json.Unmarshal(early.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode early: %v", err)
 	}
-	_ = body
-	if _, ok := raw["missing"]; !ok {
-		t.Fatalf("complete should include missing list, got %v", raw)
+	missing, ok := raw["missing"].([]interface{})
+	if !ok || len(missing) != 3 {
+		t.Fatalf("complete should list all chunks as missing, got %v", raw)
 	}
-	// Re-upload the lost chunk -> complete succeeds (clip created).
-	requireStatus(t, putChunk(t, app, uploadID, 1, sliceFor(chunkSize, data, 1)), http.StatusOK)
+	if received, _ := app.Repo.ListReceivedChunks(uploadID); len(received) != 0 {
+		t.Fatalf("receipts must be cleared after a lost container, got %v", received)
+	}
+	// The container was re-created at its declared size (zeros, sparse).
+	if info, err := os.Stat(staged); err != nil || info.Size() != int64(len(data)) {
+		t.Fatalf("container should be re-created at fileSize: %v %v", info, err)
+	}
+	// Re-upload all chunks -> complete succeeds (clip created).
+	for i := 0; i < 3; i++ {
+		requireStatus(t, putChunk(t, app, uploadID, i, sliceFor(chunkSize, data, i)), http.StatusOK)
+	}
 	requireStatus(t, completeUpload(t, app, uploadID, nil), http.StatusCreated)
 }
 
@@ -793,8 +842,8 @@ func TestCaptchaVerifiedAtInit(t *testing.T) {
 	}
 	// No session row must exist: init returned no uploadId so nothing to query;
 	// assert there are 0 upload dirs and 0 session rows.
-	if dirs, _ := storage.ListUploadDirsOnDisk(app.Settings.FileStorageDir); len(dirs) != 0 {
-		t.Fatalf("no upload dir may exist after failed init, got %v", dirs)
+	if files := storageFileNames(t, app); len(files) != 0 {
+		t.Fatalf("no storage file may exist after failed init, got %v", files)
 	}
 	if sessions, _ := app.Repo.ListUploadSessions(); len(sessions) != 0 {
 		t.Fatalf("no session row may exist after failed init, got %v", sessions)

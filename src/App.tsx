@@ -476,8 +476,10 @@ const App = () => {
           attempt: progress.attempt ?? 1,
           max: progress.maxAttempts ?? 1
         });
-      case "assembling":
-        return t("upload.assembling");
+      case "restarting":
+        return t("upload.restarting");
+      case "finalizing":
+        return t("upload.finalizing");
       case "cancelled":
         return t("upload.cancelled");
       case "failed":
@@ -626,8 +628,9 @@ const App = () => {
             accessToken: usingToken ? tokenValue : undefined
           },
           // Captcha and the clip params are sent at init so they are validated
-          // before any chunk consumes storage; complete only assembles the
-          // already-validated session.
+          // before any chunk consumes storage. The server pre-allocates the
+          // final file at init and each chunk is written into its byte range,
+          // so complete has no merge step -- it only inserts the clip row.
           captchaToken: isCaptchaEnabled ? captchaToken : undefined,
           captchaProvider: captchaProvider ?? undefined,
           concurrency: 3,
@@ -663,25 +666,31 @@ const App = () => {
           );
         } else {
           const status = (error as Error & { status?: number }).status;
+          const reason =
+            error instanceof Error ? error.message : t("toast.createFailed");
           const isTimeout =
             (error as Error & { timeout?: boolean }).timeout === true ||
             (error instanceof Error && error.message.toLowerCase().includes("timeout"));
-          if (status === 410) {
+          if (status === 410 || status === 404) {
             setToast({ kind: "error", message: t("toast.uploadSessionExpired") });
+          } else if (status === 507) {
+            // Typed storage guards (upload quota / active-session cap / free
+            // disk watermark) answer 507 and their message already states which
+            // limit tripped and by how much, so surface it verbatim.
+            setToast({
+              kind: "error",
+              message: t("toast.uploadStorageExceeded", { reason })
+            });
           } else if (isTimeout) {
             setToast({ kind: "error", message: t("toast.uploadTimeout") });
-          } else {
-            const reason =
-              error instanceof Error ? error.message : t("toast.createFailed");
+          } else if (status === undefined && reason && /failed to fetch|network|load failed/i.test(reason)) {
             // Network drop without status: hint that retry resumes.
-            if (status === undefined && reason && /failed to fetch|network|load failed/i.test(reason)) {
-              setToast({ kind: "error", message: t("upload.networkError") });
-            } else {
-              setToast({
-                kind: "error",
-                message: t("toast.uploadFailed", { reason })
-              });
-            }
+            setToast({ kind: "error", message: t("upload.networkError") });
+          } else {
+            setToast({
+              kind: "error",
+              message: t("toast.uploadFailed", { reason })
+            });
           }
           setUploadProgress((prev) =>
             prev ? { ...prev, status: "failed" } : prev
@@ -1165,7 +1174,7 @@ const App = () => {
                         uploadProgress.status === "retrying" ||
                         uploadProgress.status === "resuming" ||
                         uploadProgress.status === "initializing" ||
-                        uploadProgress.status === "assembling") ? (
+                        uploadProgress.status === "restarting") ? (
                         <button
                           type="button"
                           className="btn btn--tiny btn--danger"
