@@ -55,9 +55,29 @@ export const buildResumeKey = (params: {
   filename: string;
   fileSize: number;
   lastModified: number;
+  // Clip params are frozen server-side at init, so the resume slot must be
+  // keyed by the access mode too: switching from a short code to a token (or
+  // changing the code) has to start a NEW session instead of replaying one
+  // whose frozen params can never succeed again.
+  accessCode?: string;
+  accessToken?: string;
 }): string => {
   const { environmentId, filename, fileSize, lastModified } = params;
-  return `super-clipboard::upload:${environmentId}::${filename}::${fileSize}::${lastModified}`;
+  const access = `${params.accessCode ?? ""}|${params.accessToken ? "token" : ""}`;
+  return `super-clipboard::upload:${environmentId}::${filename}::${fileSize}::${lastModified}::${access}`;
+};
+
+// A complete that fails for a reason the frozen session params cannot fix (a
+// short code taken by a parallel upload, the expiry elapsing while the bytes
+// were in flight, a token re-registered elsewhere) leaves the session rolled
+// back to `active` server-side. Resuming that same session would fail forever,
+// so such a failure drops the resume state -- while a missing chunk (400 with a
+// `missing` list) and transient/network errors stay resumable.
+export const isUnrecoverableCompleteFailure = (error: unknown): boolean => {
+  const status = (error as Error & { status?: number }).status;
+  const missing = (error as Error & { missing?: number[] }).missing;
+  if (Array.isArray(missing) && missing.length > 0) return false;
+  return status === 400 || status === 409 || status === 410;
 };
 
 // Resume entries now persist both the server uploadId and the client
@@ -252,7 +272,9 @@ export const uploadFileChunked = async (
     environmentId,
     filename,
     fileSize: totalBytes,
-    lastModified: (file as File).lastModified ?? 0
+    lastModified: (file as File).lastModified ?? 0,
+    accessCode: clip.accessCode,
+    accessToken: clip.accessToken
   });
 
   const emit = (p: UploadProgress): void => {
@@ -261,6 +283,20 @@ export const uploadFileChunked = async (
     } catch {
       // never let progress callbacks break the upload
     }
+  };
+
+  // Rolls a doomed session back: best-effort DELETE (releases the quota
+  // reservation and the chunk dir immediately) plus dropping the resume slot so
+  // the next attempt re-inits with fresh params.
+  const discardResumeState = async (): Promise<void> => {
+    if (uploadId) {
+      try {
+        await abortFileUpload(uploadId);
+      } catch {
+        // 404/410: already gone, or the TTL worker will reap it.
+      }
+    }
+    clearStoredUploadId(resumeKey);
   };
 
   throwIfAborted(signal);
@@ -392,6 +428,9 @@ export const uploadFileChunked = async (
           });
           throw new DOMException("Upload cancelled", "AbortError");
         }
+        if (isUnrecoverableCompleteFailure(error)) {
+          await discardResumeState();
+        }
         emit({
           uploadId, uploadedBytes: totalBytes, totalBytes,
           uploadedChunks: totalChunks, totalChunks, percent: 100, status: "failed"
@@ -429,6 +468,10 @@ export const uploadFileChunked = async (
       if (Array.isArray(missing) && missing.length > 0) {
         for (const idx of missing) receivedSet.delete(idx);
         uploadedChunks = receivedSet.size;
+      } else if (isUnrecoverableCompleteFailure(error)) {
+        // Rolled-back session (conflict / expired params): a resume can never
+        // succeed, so clear it and let the user retry with fresh params.
+        await discardResumeState();
       }
       emit({
         uploadId,

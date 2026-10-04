@@ -306,9 +306,12 @@ func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionPara
 				}
 				// Expired key: purge the stale row so the fresh insert below can
 				// reuse the index slot. File cleanup happens outside the repo.
+				// An in-flight merge (`completing`) refuses to be aborted, and
+				// then the key is still taken -- report it instead of replaying a
+				// dead session (its /complete would only ever 409/410).
 				if _, abortErr := r.AbortUploadSession(existing.ID); abortErr != nil &&
 					!errors.Is(abortErr, sql.ErrNoRows) {
-					return nil, false, abortErr
+					return nil, false, &SessionUnavailableError{Session: existing}
 				}
 			}
 		}
@@ -321,21 +324,32 @@ func (r *ClipRepository) CreateOrGetUploadSession(params CreateUploadSessionPara
 			return fresh, true, nil
 		}
 		if requestID != "" && isUniqueConstraintError(insertErr) {
-			// Lost the insert race: read the winner.
-			existing, lookupErr := r.GetUploadSessionByRequestID(env, requestID)
-			if lookupErr == nil && existing != nil {
-				return existing, false, nil
-			}
-			continue // transient: retry the whole cycle
+			// Lost the insert race: read the winner (an expired-but-unpurgeable
+			// winner is reported, never replayed).
+			return r.replayExistingSession(env, requestID)
 		}
 		return nil, false, insertErr
 	}
 	// Should be unreachable for bounded retries; treat as replay of the winner.
+	return r.replayExistingSession(env, requestID)
+}
+
+// replayExistingSession loads the session that owns an idempotency key and
+// decides whether it may be replayed: a live one is returned as-is (idempotent
+// init), while one that already expired is only replayable if its row vanished
+// in the meantime (cleanup raced us) -- otherwise the client must retry later.
+func (r *ClipRepository) replayExistingSession(env string, requestID string) (*UploadSession, bool, error) {
 	existing, lookupErr := r.GetUploadSessionByRequestID(env, requestID)
-	if lookupErr == nil && existing != nil {
-		return existing, false, nil
+	if lookupErr != nil {
+		return nil, false, lookupErr
 	}
-	return nil, false, errors.New("unable to create upload session (idempotency conflict)")
+	if existing == nil {
+		return nil, false, errors.New("unable to create upload session (idempotency conflict)")
+	}
+	if existing.IsExpired(nowUnix()) {
+		return nil, false, &SessionUnavailableError{Session: existing}
+	}
+	return existing, false, nil
 }
 
 // isUniqueConstraintError matches any SQLite UNIQUE violation (table columns
@@ -526,6 +540,14 @@ func (r *ClipRepository) TryBeginComplete(uploadID string, stagedPath string) (*
 	return session, received, nil
 }
 
+// SessionUnavailableError means an idempotency key is still held by a session
+// that is already expired but cannot be purged yet (it is mid-merge). Returning
+// that stale row would hand the client a 200 with an unusable uploadId, so the
+// caller refuses instead and lets the client retry once the merge settled.
+type SessionUnavailableError struct{ Session *UploadSession }
+
+func (e *SessionUnavailableError) Error() string { return "upload session is not usable yet" }
+
 // SessionExpiredError / SessionCompletedError / SessionCompletingError carry
 // the loaded session so handlers can render precise statuses.
 type SessionExpiredError struct{ Session *UploadSession }
@@ -626,12 +648,9 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 		return "", err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var (
-		staged   sql.NullString
-		fileSize int64
-	)
+	var staged sql.NullString
 	if err := tx.QueryRow(
-		"SELECT staged_path, file_size FROM upload_sessions WHERE id = ?", uploadID).Scan(&staged, &fileSize); err != nil {
+		"SELECT staged_path FROM upload_sessions WHERE id = ?", uploadID).Scan(&staged); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil // already aborted: nothing to roll back
 		}
@@ -642,10 +661,12 @@ func (r *ClipRepository) FailComplete(uploadID string) (string, error) {
 		UploadStatusActive, now, uploadID, UploadStatusCompleting); err != nil {
 		return "", err
 	}
-	// complete 失败回滚同样归还预留，且只能归还一次（quota_released CAS）。
-	if _, err := r.releaseQuotaTx(tx, uploadID, fileSize); err != nil {
-		return "", err
-	}
+	// The session goes back to `active` and KEEPS its chunks on disk, so it must
+	// keep its quota reservation as well: releasing here would leave live bytes
+	// unaccounted for (a quota bypass for up to the session TTL) and contradict
+	// RecomputeUploadQuota, which sums file_size over active sessions that still
+	// hold a reservation. The reservation is returned by the terminal
+	// transitions only: complete success, DELETE (abort) or expiry purge.
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
@@ -705,14 +726,21 @@ type UploadPurgeVictim struct {
 	FileSize   int64
 }
 
-// PurgeExpiredUploads deletes expired sessions (any status) and returns victims
-// for file cleanup outside the lock. Completed sessions with a clip keep their
-// clip file; only the session row + chunk dir are dropped.
+// PurgeExpiredUploads deletes expired sessions and returns victims for file
+// cleanup outside the lock. Completed sessions with a clip keep their clip file;
+// only the session row + chunk dir are dropped.
+//
+// `completing` rows are intentionally skipped: their staged file is being
+// written right now, and unlinking it would leave the clip inserted moments
+// later pointing at a file that no longer exists. A merge that fails rolls the
+// row back to `active` (and the next pass then purges it); a merge whose process
+// died is rolled back by ResetStuckCompleting on startup -- so nothing leaks.
 func (r *ClipRepository) PurgeExpiredUploads(nowUnixSec int64) ([]UploadPurgeVictim, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows, err := r.db.Query(
-		"SELECT id, staged_path, clip_id, file_size FROM upload_sessions WHERE expires_at <= ?", nowUnixSec)
+		"SELECT id, staged_path, clip_id, file_size FROM upload_sessions WHERE expires_at <= ? AND status <> ?",
+		nowUnixSec, UploadStatusCompleting)
 	if err != nil {
 		return nil, err
 	}

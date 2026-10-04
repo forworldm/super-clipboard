@@ -369,13 +369,22 @@ func (a *App) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		releaseReservation()
+		// The idempotency key is still held by a session we cannot purge yet
+		// (expired mid-merge): surface a retryable conflict instead of a 200
+		// carrying an uploadId that can only fail.
+		var unavailable *repository.SessionUnavailableError
+		if errors.As(err, &unavailable) {
+			writeError(w, newHTTPError(http.StatusConflict, "上一个上传会话仍在处理中，请稍后重试"))
+			return
+		}
 		writeError(w, err)
 		return
 	}
 	if created {
 		// The session row owns the reservation from here on; abort, expiry
-		// cleanup, complete rollback and complete success all return it through
-		// the idempotent quota_released CAS.
+		// cleanup and complete success all return it through the idempotent
+		// quota_released CAS. A failed complete rolls back to `active` and keeps
+		// both its chunks and its reservation (terminal transitions only).
 		reservationHeld = false
 	}
 	if !created {

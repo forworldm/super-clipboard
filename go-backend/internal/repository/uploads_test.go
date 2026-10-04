@@ -453,3 +453,124 @@ func TestDeleteAndRestoreChunkRecords(t *testing.T) {
 		t.Fatalf("list: %v %v", sessions, err)
 	}
 }
+
+// TestFailCompleteKeepsQuotaReservation locks the ledger invariant: a rolled
+// back complete leaves the session `active` WITH its chunks on disk, so it must
+// keep its reservation. Releasing it there would let bytes live on disk with no
+// accounting (quota bypass) and would contradict RecomputeUploadQuota, which
+// sums file_size over active sessions that still hold a reservation.
+func TestFailCompleteKeepsQuotaReservation(t *testing.T) {
+	repo := newTestRepository(t)
+	s, err := repo.CreateUploadSession(CreateUploadSessionParams{
+		Filename: "rollback.bin", FileSize: 700, ChunkSize: 1000, TTLSeconds: 3600,
+		EnvironmentID: "env-quota", ClipExpiresAt: 9_999_999_999_999,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.ReserveUploadQuota(700, 0); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := repo.MarkChunkReceived(s.ID, 0, 700); err != nil {
+		t.Fatalf("mark chunk: %v", err)
+	}
+	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/rollback-staged"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := repo.FailComplete(s.ID); err != nil {
+		t.Fatalf("fail complete: %v", err)
+	}
+	if got, _ := repo.UploadQuotaValue(); got != 700 {
+		t.Fatalf("reserved = %d after rollback, want the 700 bytes kept", got)
+	}
+	if recomputed, _, err := repo.RecomputeUploadQuota(); err != nil || recomputed != 700 {
+		t.Fatalf("recompute = %d (err %v), want 700: ledger must agree with live sessions", recomputed, err)
+	}
+	// The terminal transition (cancel) still returns the reservation exactly once.
+	if _, err := repo.AbortUploadSession(s.ID); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	if got, _ := repo.UploadQuotaValue(); got != 0 {
+		t.Fatalf("reserved = %d after abort, want 0", got)
+	}
+}
+
+// TestPurgeExpiredUploadsSkipsCompleting: a session mid-merge must never be torn
+// down by the expiry worker -- its staged file is being written right now and
+// unlinking it would leave the clip inserted moments later pointing at nothing.
+func TestPurgeExpiredUploadsSkipsCompleting(t *testing.T) {
+	repo := newTestRepository(t)
+	s, _ := repo.CreateUploadSession(CreateUploadSessionParams{
+		Filename: "inflight.bin", FileSize: 10, ChunkSize: 1000, TTLSeconds: 3600,
+		EnvironmentID: "env-inflight", ClipExpiresAt: 9_999_999_999_999,
+	})
+	if err := repo.MarkChunkReceived(s.ID, 0, 10); err != nil {
+		t.Fatalf("mark chunk: %v", err)
+	}
+	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/inflight-staged"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	// TTL elapses while the merge is still running.
+	if _, err := repo.db.Exec("UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+		time.Now().Add(-time.Minute).Unix(), s.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	victims, err := repo.PurgeExpiredUploads(time.Now().Unix())
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if len(victims) != 0 {
+		t.Fatalf("an in-flight merge must not be purged, got %v", victims)
+	}
+	if cur, _ := repo.GetUploadSession(s.ID); cur == nil || cur.Status != UploadStatusCompleting {
+		t.Fatalf("completing session must survive the purge: %+v", cur)
+	}
+	// Once the merge rolls back to active, the same row becomes purgeable.
+	if _, err := repo.FailComplete(s.ID); err != nil {
+		t.Fatalf("fail complete: %v", err)
+	}
+	victims, err = repo.PurgeExpiredUploads(time.Now().Unix())
+	if err != nil || len(victims) != 1 || victims[0].UploadID != s.ID {
+		t.Fatalf("rolled-back expired session should be purged, got %v (err %v)", victims, err)
+	}
+}
+
+// TestInitReplayRefusesStaleInFlightSession: when the (env, requestId) slot is
+// held by a session that already expired while still mid-merge, init must NOT
+// answer 200 with that unusable id -- it reports a retryable conflict instead.
+func TestInitReplayRefusesStaleInFlightSession(t *testing.T) {
+	repo := newTestRepository(t)
+	params := CreateUploadSessionParams{
+		Filename: "stale.bin", FileSize: 100, ChunkSize: 1000, TTLSeconds: 60,
+		EnvironmentID: "env-stale", RequestID: "req-stale",
+		ClipExpiresAt: 9_999_999_999_999,
+	}
+	s, created, err := repo.CreateOrGetUploadSession(params)
+	if err != nil || !created {
+		t.Fatalf("first init should create: %v %v", created, err)
+	}
+	if err := repo.MarkChunkReceived(s.ID, 0, 100); err != nil {
+		t.Fatalf("mark chunk: %v", err)
+	}
+	if _, _, err := repo.TryBeginComplete(s.ID, "/tmp/stale-staged"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := repo.db.Exec("UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+		time.Now().Add(-time.Minute).Unix(), s.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	replayed, created, err := repo.CreateOrGetUploadSession(params)
+	var unavailable *SessionUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected SessionUnavailableError, got replayed=%+v created=%v err=%v", replayed, created, err)
+	}
+	if unavailable.Session == nil || unavailable.Session.ID != s.ID {
+		t.Fatalf("error should carry the blocking session, got %+v", unavailable.Session)
+	}
+	// A different requestId is unaffected (new session, no conflict).
+	other := params
+	other.RequestID = "req-other"
+	if _, created, err := repo.CreateOrGetUploadSession(other); err != nil || !created {
+		t.Fatalf("unrelated key should still create: %v %v", created, err)
+	}
+}

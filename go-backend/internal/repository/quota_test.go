@@ -274,9 +274,11 @@ func TestUploadQuotaReleasedOnComplete(t *testing.T) {
 	}
 }
 
-// TestFailCompleteReleasesQuotaOnce: the complete rollback path also returns
-// the bytes, and only once.
-func TestFailCompleteReleasesQuotaOnce(t *testing.T) {
+// TestFailCompleteKeepsReservationUntilTerminal: the complete rollback path
+// returns the session to `active` with its chunks still on disk, so the bytes
+// MUST stay reserved (otherwise they would occupy disk unaccounted for). The
+// reservation comes back exactly once on the terminal transition (abort).
+func TestFailCompleteKeepsReservationUntilTerminal(t *testing.T) {
 	repo := newTestRepository(t)
 	session := createReservingSession(t, repo, "fail.bin", 512, 0)
 	if err := repo.MarkChunkReceived(session.ID, 0, 512); err != nil {
@@ -288,15 +290,28 @@ func TestFailCompleteReleasesQuotaOnce(t *testing.T) {
 	if _, err := repo.FailComplete(session.ID); err != nil {
 		t.Fatalf("fail complete: %v", err)
 	}
+	if got := reservedBytes(t, repo); got != 512 {
+		t.Fatalf("reserved = %d after rollback, want the 512 bytes kept", got)
+	}
+	// The rolled-back session is resumable: a retry releases nothing extra.
+	if _, err := repo.FailComplete(session.ID); err != nil {
+		t.Fatalf("second fail complete: %v", err)
+	}
+	if got := reservedBytes(t, repo); got != 512 {
+		t.Fatalf("reserved = %d, want 512 (rollback idempotent)", got)
+	}
+	if _, err := repo.AbortUploadSession(session.ID); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
 	if got := reservedBytes(t, repo); got != 0 {
-		t.Fatalf("reserved = %d after rollback, want 0", got)
+		t.Fatalf("reserved = %d after abort, want 0", got)
 	}
 	released, err := repo.ReleaseUploadQuota(session.ID, session.FileSize)
 	if err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	if released {
-		t.Fatal("rollback already returned the reservation")
+		t.Fatal("abort already returned the reservation")
 	}
 }
 
